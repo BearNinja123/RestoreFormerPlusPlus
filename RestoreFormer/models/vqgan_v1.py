@@ -22,6 +22,7 @@ class RestoreFormerModel(pl.LightningModule):
                  ):
         super().__init__()
         self.automatic_optimization = False
+        self.save_hyperparameters()
         self.image_key = image_key
         self.vqvae = instantiate_from_config(ddconfig)
 
