@@ -28,6 +28,7 @@ class ActNorm(nn.Module):
                 .unsqueeze(2)
                 .unsqueeze(3)
                 .permute(1, 0, 2, 3)
+                .contiguous() # fix stride warning
             )
             std = (
                 flatten.std(1)
@@ -35,6 +36,7 @@ class ActNorm(nn.Module):
                 .unsqueeze(2)
                 .unsqueeze(3)
                 .permute(1, 0, 2, 3)
+                .contiguous() # fix stride warning
             )
 
             self.loc.data.copy_(-mean)

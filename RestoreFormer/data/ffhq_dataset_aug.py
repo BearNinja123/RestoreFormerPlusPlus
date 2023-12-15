@@ -2,7 +2,7 @@ import random
 import time
 from os import path as osp
 from torch.utils import data as data
-from torchvision.transforms.functional import normalize
+from torchvision.transforms.functional import normalize, rgb_to_grayscale
 
 from basicsr.data.transforms import augment
 from basicsr.utils import FileClient, get_root_logger, imfrombytes, img2tensor
@@ -34,8 +34,8 @@ class FFHQAugDataset(data.Dataset):
         self.io_backend_opt = opt['io_backend']
 
         self.gt_folder = opt['dataroot_gt']
-        self.mean = opt['mean']
-        self.std = opt['std']
+        self.mean = np.array(opt['mean'])
+        self.std = np.array(opt['std'])
 
         if self.io_backend_opt['type'] == 'lmdb':
             self.io_backend_opt['db_paths'] = self.gt_folder
@@ -92,15 +92,16 @@ class FFHQAugDataset(data.Dataset):
                 break
             finally:
                 retry -= 1
-        img_gt = imfrombytes(img_bytes, float32=True)
+        #img_gt = imfrombytes(img_bytes, float32=True)
+        img_gt = imfrombytes(img_bytes) # stored as uint8
 
         # random horizontal flip
         img_gt = augment(img_gt, hflip=self.opt['use_hflip'], rotation=False)
         h, w, _ = img_gt.shape
 
-        if (self.exposure_prob is not None) and (np.random.uniform() < self.exposure_prob):
-                exp_scale = np.random.uniform(self.exposure_range[0], self.exposure_range[1])
-                img_gt *= exp_scale
+        #if (self.exposure_prob is not None) and (np.random.uniform() < self.exposure_prob):
+        #        exp_scale = np.random.uniform(self.exposure_range[0], self.exposure_range[1])
+        #        img_gt *= exp_scale
 
         if (self.shift_prob is not None) and (np.random.uniform() < self.shift_prob ):
             # self.shift_unit = 32
@@ -114,16 +115,25 @@ class FFHQAugDataset(data.Dataset):
                                 mode='symmetric')
             img_gt = img_gt_pad[shift_v:shift_v + h, shift_h: shift_h + w,:]
 
-        # random to gray (only for lq)
-        if self.gray_prob and np.random.uniform() < self.gray_prob:
-                img_gt = cv2.cvtColor(img_gt, cv2.COLOR_BGR2GRAY)
-                img_gt = np.tile(img_gt[:, :, None], [1, 1, 3])
-
         # BGR to RGB, HWC to CHW, numpy to tensor
-        img_gt = img2tensor(img_gt, bgr2rgb=True, float32=True)
+        #img_gt = img2tensor(img_gt, bgr2rgb=True, float32=True)
+        img_gt = img2tensor(img_gt, bgr2rgb=False, float32=False)
         # normalize
-        normalize(img_gt, self.mean, self.std, inplace=True)
-        return {'gt': img_gt, 'gt_path': gt_path}
+        #normalize(img_gt, self.mean, self.std, inplace=True)
+        #normalize(img_gt, 255 * exp_scale * self.mean, 255 * exp_scale * self.std, inplace=True)
+        #return {'gt': img_gt, 'gt_path': gt_path}
+
+        # random to gray (only for lq)
+        exp_scale = 1.0
+        if (self.exposure_prob is not None) and (np.random.uniform() < self.exposure_prob):
+            exp_scale = np.random.uniform(self.exposure_range[0], self.exposure_range[1])
+            #img_gt *= exp_scale
+        if self.gray_prob and np.random.uniform() < self.gray_prob:
+            #img_gt = cv2.cvtColor(img_gt, cv2.COLOR_RGB2GRAY)
+            #img_gt = np.tile(img_gt[:, :, None], [1, 1, 3])
+            img_gt = rgb_to_grayscale(img_gt, num_output_channels=3)
+
+        return {'gt': img_gt, 'gt_path': gt_path, 'mean': exp_scale * self.mean, 'rstd': 1 / (exp_scale * self.std)}
 
     def __len__(self):
         return len(self.paths)

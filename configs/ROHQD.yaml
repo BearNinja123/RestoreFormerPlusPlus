@@ -3,8 +3,8 @@ model:
   target: RestoreFormer.models.vqgan_v1.RestoreFormerModel
   params:
     image_key: 'gt'
-    ckpt_path: '/group/30042/zhouxiawang/checkpoints/RestoreFormer/release/logs/2022-11-11T18-36-57_ROHQDROHQD_gpus7_lmdb_h4_seed30/checkpoints/last.ckpt.62'
-    schedule_step: [400000, 800000]
+    ckpt_path: /scratch/tnguy231/RFExperiments/tnguy231/logs/debug_runs/2023-12-14T19-22-06_ROHQDROHQD_gpus1_seed64/checkpoints/last.ckpt # YOUR MODEL PATH GOES HERE
+    schedule_step: [100000, 200000]
     # ignore_keys: ['vqvae.quantize.utility_counter']
     ddconfig:
       target: RestoreFormer.modules.vqvae.vqvae_arch.VQVAEGAN
@@ -31,7 +31,7 @@ model:
       params:
         disc_conditional: False
         disc_in_channels: 3
-        disc_start: 30001
+        disc_start: 10001
         disc_weight: 0.8
         codebook_weight: 1.0
         use_actnorm: False
@@ -39,20 +39,17 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 4
-    num_workers: 8
+    batch_size: 16 # per device (i.e. 16 images per gpu per batch)
+    num_workers: 15
     train:
       target: RestoreFormer.data.ffhq_dataset_aug.FFHQAugDataset
       params:
-        # dataroot_gt: data/ffhq/ffhq_512
-        # io_backend:
-        #   type: disk
-        dataroot_gt: data/ffhq/ffhq_512.lmdb
+        dataroot_gt: /scratch/tnguy231/FFHQ/image512x512 # YOUR IMAGE DATASET PATH GOES HERE
         io_backend:
-          type: lmdb
+          type: disk
         use_hflip: True
-        mean: [0.5, 0.5, 0.5]
-        std: [0.5, 0.5, 0.5]
+        mean: [127.5, 127.5, 127.5]
+        std: [127.5, 127.5, 127.5]
         out_size: 512
         gray_prob: 0.008
         gt_gray: True
@@ -61,20 +58,44 @@ data:
         shift_prob: 0.2
         shift_unit: 1
         shift_max_num: 32
-    validation:
-      target: RestoreFormer.data.ffhq_dataset_aug.FFHQAugDataset
-      params:
-        dataroot_gt: data/val
-        io_backend:
-          type: disk
-        use_hflip: False
-        mean: [0.5, 0.5, 0.5]
-        std: [0.5, 0.5, 0.5]
-        out_size: 512
-        gray_prob: ~
-        gt_gray: True
-        exposure_prob: ~
-        exposure_range: [0.7, 1.1]
-        shift_prob: ~
-        shift_unit: 1
-        shift_max_num: 32
+        #validation:
+        #  target: RestoreFormer.data.ffhq_dataset_aug.FFHQAugDataset
+        #  params:
+        #    dataroot_gt: data/val
+        #    io_backend:
+        #      type: disk
+        #    use_hflip: False
+        #    mean: [0.5, 0.5, 0.5]
+        #    std: [0.5, 0.5, 0.5]
+        #    out_size: 512
+        #    gray_prob: ~
+        #    gt_gray: True
+        #    exposure_prob: ~
+        #    exposure_range: [0.7, 1.1]
+        #    shift_prob: ~
+        #    shift_unit: 1
+        #    shift_max_num: 32
+
+lightning:
+  trainer:
+    devices: "0,1,2,3"
+    accelerator: cuda
+    accumulate_grad_batches: 1
+    precision: bf16-true
+
+  #profiler:
+  #  target: lightning.pytorch.profilers.PyTorchProfiler
+  #  params:
+  #    dirpath: perf_logs
+  #    filename: log
+  #    export_to_chrome: True
+  #    # profiler kwargs
+  #    profile_memory: True
+  #    with_flops: True
+  #    schedule:
+  #      target: torch.profiler.schedule
+  #      params:
+  #        wait: 10
+  #        warmup: 1
+  #        active: 3
+  #        repeat: 1

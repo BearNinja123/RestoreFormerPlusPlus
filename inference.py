@@ -51,6 +51,7 @@ def main():
         help='Image extension. Options: auto | jpg | png, auto means using the same extension as inputs. Default: auto')
 
     parser.add_argument('--save', action='store_true', help='Save results')
+    parser.add_argument('-r', '--ref_dir', type=str, default=None, help='reference image dir.')
 
     args = parser.parse_args()
 
@@ -96,7 +97,7 @@ def main():
         channel_multiplier = 2
         model_name = 'RestoreFormer++'
         url = 'https://github.com/wzhouxiff/RestoreFormerPlusPlus/releases/download/v1.0.0/RestoreFormer++.ckpt'
-        url = None
+        #url = None
     else:
         raise ValueError(f'Wrong model version {args.version}.')
 
@@ -121,11 +122,16 @@ def main():
         img_list = [args.input]
     else:
         img_list = sorted(glob.glob(os.path.join(args.input, '*')))
+    if args.ref_dir is not None:
+        if os.path.isfile(args.ref_dir):
+            ref_list = [args.ref_dir]
+        else:
+            ref_list = sorted(glob.glob(os.path.join(args.ref_dir, '*')))
 
     os.makedirs(args.output, exist_ok=True)
 
     # ------------------------ restore ------------------------
-    for img_path in img_list:
+    for img_idx, img_path in enumerate(img_list):
         # read image
         img_name = os.path.basename(img_path)
         print(f'Processing {img_name} ...')
@@ -133,11 +139,23 @@ def main():
         input_img = cv2.imread(img_path, cv2.IMREAD_COLOR)
 
         # restore faces and background if necessary
-        cropped_faces, restored_faces, restored_img = restorer.enhance(
-            input_img,
-            has_aligned=args.aligned,
-            only_center_face=args.only_center_face,
-            paste_back=True)
+        if args.ref_dir is None:
+            cropped_faces, restored_faces, restored_img = restorer.enhance(
+                input_img,
+                has_aligned=args.aligned,
+                only_center_face=args.only_center_face,
+                paste_back=True,
+                )
+        else:
+            #cropped_faces, restored_faces, restored_img = restorer.enhance(
+            cropped_faces, restored_faces, restored_img = restorer.ref_enhance(
+                input_img,
+                cv2.imread(ref_list[img_idx], cv2.IMREAD_COLOR),
+                has_aligned=args.aligned,
+                only_center_face=args.only_center_face,
+                paste_back=True,
+                #ref_img=cv2.imread(ref_list[img_idx], cv2.IMREAD_COLOR) if args.ref_dir is not None else None
+                )
 
         # save faces
         for idx, (cropped_face, restored_face) in enumerate(zip(cropped_faces, restored_faces)):

@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+torch.backends.cuda.enable_flash_sdp(True)
 
 class VectorQuantizer(nn.Module):
     """
@@ -37,18 +37,51 @@ class VectorQuantizer(nn.Module):
         """
         # reshape z -> (batch, height, width, channel) and flatten
         z = z.permute(0, 2, 3, 1).contiguous()
+
+        z_flattened = z.view(-1, self.e_dim)
+        # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
+        d = (z_flattened ** 2).sum(1, keepdim=True) + \
+            (self.embedding.weight ** 2).sum(1) - 2 * \
+            (z_flattened @ self.embedding.weight.t())
+
+        min_encoding_indices = torch.argmin(d, dim=1)
+        z_q = self.embedding(min_encoding_indices).view(z.shape).contiguous()
+
+        # compute loss for embedding
+        loss = torch.mean((z_q.detach()-z)**2) + self.beta * \
+            torch.mean((z_q - z.detach()) ** 2)
+
+        # preserve gradients
+        z_q = z + (z_q - z).detach()
+
+        # reshape back to match original input shape
+        z_q = z_q.permute(0, 3, 1, 2).contiguous()
+        return z_q, loss, (None, None, min_encoding_indices, d)
+
+    def forwardSlow(self, z):
+        """
+        Inputs the output of the encoder network z and maps it to a discrete
+        one-hot vector that is the index of the closest embedding vector e_j
+        z (continuous) -> z_q (discrete)
+        z.shape = (batch, channel, height, width)
+        quantization pipeline:
+            1. get encoder input (B,C,H,W)
+            2. flatten input to (B*H*W,C)
+        """
+        # reshape z -> (batch, height, width, channel) and flatten
+        z = z.permute(0, 2, 3, 1).contiguous()
         z_flattened = z.view(-1, self.e_dim)
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
 
-        d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
-            torch.sum(self.embedding.weight**2, dim=1) - 2 * \
-            torch.matmul(z_flattened, self.embedding.weight.t())
+        d = (z_flattened ** 2).sum(1, keepdim=True) + \
+            (self.embedding.weight ** 2).sum(1) - 2 * \
+            (z_flattened @ self.embedding.weight.t())
 
         ## could possible replace this here
         # #\start...
         # find closest encodings
 
-        min_value, min_encoding_indices = torch.min(d, dim=1)
+        _min_value, min_encoding_indices = torch.min(d, dim=1)
 
         min_encoding_indices = min_encoding_indices.unsqueeze(1)
 
@@ -90,11 +123,12 @@ class VectorQuantizer(nn.Module):
     def get_codebook_entry(self, indices, shape):
         # shape specifying (batch, height, width, channel)
         # TODO: check for more easy handling with nn.Embedding
-        min_encodings = torch.zeros(indices.shape[0], self.n_e).to(indices)
-        min_encodings.scatter_(1, indices[:,None], 1)
+        #min_encodings = torch.zeros(indices.shape[0], self.n_e).to(indices)
+        #min_encodings.scatter_(1, indices[:,None], 1)
 
         # get quantized latent vectors
-        z_q = torch.matmul(min_encodings.float(), self.embedding.weight)
+        #z_q = torch.matmul(min_encodings.float(), self.embedding.weight)
+        z_q = self.embedding.weight[indices]
 
         if shape is not None:
             z_q = z_q.view(shape)
@@ -105,14 +139,22 @@ class VectorQuantizer(nn.Module):
         return z_q
 
 # pytorch_diffusion + derived encoder decoder
-def nonlinearity(x):
-    # swish
-    return x*torch.sigmoid(x)
+#def nonlinearity(x):
+#    # swish
+#    return x*torch.sigmoid(x)
+nonlinearity = F.silu
 
+#def Normalize(in_channels):
+#    return torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
 
-def Normalize(in_channels):
-    return torch.nn.GroupNorm(num_groups=32, num_channels=in_channels, eps=1e-6, affine=True)
-
+class Normalize(nn.Module): # runs GroupNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
+    def __init__(self, in_channels: int, num_groups: int = 32):
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups, in_channels, eps=1e-6, affine=True)
+    
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+    def forward(self, x):
+        return self.norm(x)
 
 class Upsample(nn.Module):
     def __init__(self, in_channels, with_conv):
@@ -213,10 +255,10 @@ class ResnetBlock(nn.Module):
             else:
                 x = self.nin_shortcut(x)
 
-        return x+h
+        return x + h
 
 
-class MultiHeadAttnBlock(nn.Module):
+class MultiHeadAttnBlockOld(nn.Module):
     def __init__(self, in_channels, head_size=1):
         super().__init__()
         self.in_channels = in_channels
@@ -292,6 +334,64 @@ class MultiHeadAttnBlock(nn.Module):
 
         return x+w_
 
+class MultiHeadAttnBlock(nn.Module):
+    def __init__(self, in_channels, head_size=1):
+        super().__init__()
+        self.in_channels = in_channels
+        self.head_size = head_size
+        self.att_size = in_channels // head_size
+        assert(in_channels % head_size == 0), 'The size of head should be divided by the number of channels.'
+
+        self.norm1 = Normalize(in_channels)
+        self.norm2 = Normalize(in_channels)
+
+        self.q = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.k = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.v = torch.nn.Conv2d(in_channels,
+                                 in_channels,
+                                 kernel_size=1,
+                                 stride=1,
+                                 padding=0)
+        self.proj_out = torch.nn.Conv2d(in_channels,
+                                        in_channels,
+                                        kernel_size=1,
+                                        stride=1,
+                                        padding=0)
+        self.num = 0
+
+    def split_heads(self, x):
+        B, _C, H, W = x.shape
+        # M N (H D) -> M H N D, D = d_head (self.att_size), H = num heads (self.head_size)
+        return x.reshape(B, self.head_size, self.att_size, H * W).permute(0, 1, 3, 2).contiguous()
+
+    def forward(self, x, y=None):
+        B, C, H, W = x.shape
+        h_ = x
+        h_ = self.norm1(h_)
+        if y is None:
+            y = h_
+        else:
+            y = self.norm2(y)
+
+        q = self.q(y)
+        k = self.k(h_)
+        v = self.v(h_)
+        q, k, v = map(self.split_heads, (q, k, v))
+
+        # compute attention
+        qkv = F.scaled_dot_product_attention(q, k, v)
+        w_ = qkv.permute(0, 1, 3, 2).reshape(B, C, H, W).contiguous() # M H N D -> M H D N -> B C H W
+        w_ = self.proj_out(w_)
+
+        return x + w_
 
 class MultiHeadEncoder(nn.Module):
     def __init__(self, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks=2,
@@ -649,7 +749,6 @@ class VQVAEGAN(nn.Module):
                 param.requires_grad = False
 
     def encode(self, x):
-
         hs = self.encoder(x)
         h = self.quant_conv(hs['out'])
         quant, emb_loss, info = self.quantize(h)
@@ -732,6 +831,7 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
         hs = self.encoder(x)
         h = self.quant_conv(hs['out'])
         quant, emb_loss, info = self.quantize(h)
+        print(f'Emb loss: {emb_loss}')
         return quant, emb_loss, info, hs
 
     def decode(self, quant, hs):
@@ -740,8 +840,12 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
 
         return dec
 
-    def forward(self, input):
+    def forward(self, input, ref=None):
         quant, diff, info, hs = self.encode(input)
+        if ref is not None:
+            quant2, _diff, _info, _hs = self.encode(ref)
+            print('quant img-ref diff', F.mse_loss(quant, quant2))
+            quant = quant2
         dec = self.decode(quant, hs)
 
         return dec, diff, info, hs

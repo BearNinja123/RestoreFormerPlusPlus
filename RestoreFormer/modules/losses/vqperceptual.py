@@ -3,7 +3,9 @@ from copy import deepcopy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from basicsr.losses.losses import GANLoss, L1Loss
+#from basicsr.losses.losses import GANLoss, L1Loss
+from basicsr.losses.basic_loss import L1Loss
+from basicsr.losses.gan_loss import GANLoss
 
 from RestoreFormer.modules.discriminator.model import (NLayerDiscriminator,
                                                        weights_init)
@@ -128,8 +130,8 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
             torch.Tensor: Gram matrix.
         """
         n, c, h, w = x.size()
-        features = x.view(n, c, w * h)
-        features_t = features.transpose(1, 2)
+        features = x.view(n, c, h * w)
+        features_t = features.transpose(1, 2).contiguous() # fix stride warning
         gram = features.bmm(features_t) / (c * h * w)
         return gram
 

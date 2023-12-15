@@ -9,8 +9,10 @@ import pytorch_lightning as pl
 from pytorch_lightning import seed_everything
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
-from pytorch_lightning.utilities.distributed import rank_zero_only
-import random
+from pytorch_lightning.utilities.rank_zero import rank_zero_only
+from copy import deepcopy
+import random, wandb
+torch.set_float32_matmul_precision('high')
 
 def get_obj_from_str(string, reload=False):
     module, cls = string.rsplit(".", 1)
@@ -133,10 +135,10 @@ def get_parser(**parser_kwargs):
 
     return parser
 
-
 def nondefault_trainer_args(opt):
     parser = argparse.ArgumentParser()
-    parser = Trainer.add_argparse_args(parser)
+    #parser = cli.add_arguments_to_parser(parser)
+    #parser = Trainer.add_argparse_args(parser)
     args = parser.parse_args([])
     return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
 
@@ -196,7 +198,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
     def _train_dataloader(self):
         return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, shuffle=True)
+                          num_workers=self.num_workers, shuffle=True, persistent_workers=True, pin_memory=True)
 
     def _val_dataloader(self):
         return DataLoader(self.datasets["validation"],
@@ -246,7 +248,6 @@ class ImageLogger(Callback):
         self.max_images = max_images
         self.logger_log_images = {
             pl.loggers.WandbLogger: self._wandb,
-            pl.loggers.TestTubeLogger: self._testtube,
         }
         self.log_steps = [2 ** n for n in range(int(np.log2(self.batch_freq)) + 1)]
         if not increase_log_steps:
@@ -255,23 +256,11 @@ class ImageLogger(Callback):
 
     @rank_zero_only
     def _wandb(self, pl_module, images, batch_idx, split):
-        raise ValueError("No way wandb")
         grids = dict()
         for k in images:
             grid = torchvision.utils.make_grid(images[k])
-            grids[f"{split}/{k}"] = wandb.Image(grid)
+            grids[f"{split}/{k}"] = wandb.Image(grid, )
         pl_module.logger.experiment.log(grids)
-
-    @rank_zero_only
-    def _testtube(self, pl_module, images, batch_idx, split):
-        for k in images:
-            grid = torchvision.utils.make_grid(images[k])
-            grid = (grid+1.0)/2.0 # -1,1 -> 0,1; c,h,w
-
-            tag = f"{split}/{k}"
-            pl_module.logger.experiment.add_image(
-                tag, grid,
-                global_step=pl_module.global_step)
 
     @rank_zero_only
     def log_local(self, save_dir, split, images,
@@ -282,7 +271,7 @@ class ImageLogger(Callback):
 
             grid = (grid+1.0)/2.0 # -1,1 -> 0,1; c,h,w
             grid = grid.transpose(0,1).transpose(1,2).squeeze(-1)
-            grid = grid.numpy()
+            grid = grid.float().numpy()
             grid = (grid*255).astype(np.uint8)
             filename = "{}_gs-{:06}_e-{:06}_b-{:06}.png".format(
                 k,
@@ -333,13 +322,11 @@ class ImageLogger(Callback):
             return True
         return False
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self.log_img(pl_module, batch, batch_idx, split="train")
 
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self.log_img(pl_module, batch, batch_idx, split="val")
-
-
 
 if __name__ == "__main__":
     # custom parser to specify config files, train, test and debug mode,
@@ -390,7 +377,6 @@ if __name__ == "__main__":
     sys.path.append(os.getcwd())
 
     parser = get_parser()
-    parser = Trainer.add_argparse_args(parser)
 
     opt, unknown = parser.parse_known_args()
     if opt.name and opt.resume:
@@ -433,6 +419,7 @@ if __name__ == "__main__":
     if opt.random_seed:
         opt.seed = random.randint(1,100)
     logdir = logdir + '_seed' + str(opt.seed)
+    rank_zero_only(os.makedirs)(logdir)
     
     ckptdir = os.path.join(logdir, "checkpoints")
     cfgdir = os.path.join(logdir, "configs")
@@ -444,23 +431,20 @@ if __name__ == "__main__":
         configs = [OmegaConf.load(cfg) for cfg in opt.base]
         cli = OmegaConf.from_dotlist(unknown)
         config = OmegaConf.merge(*configs, cli)
+        whole_config = deepcopy(config)
         lightning_config = config.pop("lightning", OmegaConf.create())
         # merge trainer cli with config
         trainer_config = lightning_config.get("trainer", OmegaConf.create())
-        # default to ddp
-        # trainer_config["distributed_backend"] = "ddp"
-        trainer_config["accelerator"] = "ddp"
-        # trainer_config["plugins"]="ddp_sharded"
+        
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
-        if not "gpus" in trainer_config:
-            del trainer_config["distributed_backend"]
+        if not "devices" in trainer_config:
+            #del trainer_config["distributed_backend"]
             cpu = True
         else:
-            gpuinfo = trainer_config["gpus"]
+            gpuinfo = trainer_config["devices"]
             print(f"Running on GPUs {gpuinfo}")
             cpu = False
-        trainer_opt = argparse.Namespace(**trainer_config)
         lightning_config.trainer = trainer_config
 
         # model
@@ -471,10 +455,6 @@ if __name__ == "__main__":
         # trainer_kwargs['sync_batchnorm'] = True
         
         # default logger configs
-        # NOTE wandb < 0.10.0 interferes with shutdown
-        # wandb >= 0.10.0 seems to fix it but still interferes with pudb
-        # debugging (wrongly sized pudb ui)
-        # thus prefer testtube for now
         default_logger_cfgs = {
             "wandb": {
                 "target": "pytorch_lightning.loggers.WandbLogger",
@@ -483,18 +463,15 @@ if __name__ == "__main__":
                     "save_dir": logdir,
                     "offline": opt.debug,
                     "id": nowname,
-                }
-            },
-            "testtube": {
-                "target": "pytorch_lightning.loggers.TestTubeLogger",
-                "params": {
-                    "name": "testtube",
-                    "save_dir": logdir,
+                    "config": OmegaConf.to_container(whole_config),
                 }
             },
         }
-        default_logger_cfg = default_logger_cfgs["testtube"]
-        logger_cfg = lightning_config.logger or OmegaConf.create()
+        default_logger_cfg = default_logger_cfgs["wandb"]
+        try:
+            logger_cfg = lightning_config.logger
+        except:
+            logger_cfg = OmegaConf.create()
         logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)
         trainer_kwargs["logger"] = instantiate_from_config(logger_cfg)
 
@@ -507,7 +484,7 @@ if __name__ == "__main__":
                 "filename": "{epoch:06}",
                 "verbose": True,
                 "save_last": True,
-                "period": 1
+                "every_n_epochs": 1
             }
         }
         if hasattr(model, "monitor"):
@@ -515,9 +492,23 @@ if __name__ == "__main__":
             default_modelckpt_cfg["params"]["monitor"] = model.monitor
             default_modelckpt_cfg["params"]["save_top_k"] = 3
 
-        modelckpt_cfg = lightning_config.modelcheckpoint or OmegaConf.create()
+        try:
+            modelckpt_cfg = lightning_config.modelcheckpoint
+        except:
+            modelckpt_cfg = OmegaConf.create()
         modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
-        trainer_kwargs["checkpoint_callback"] = instantiate_from_config(modelckpt_cfg)
+        #trainer_kwargs["checkpoint_callback"] = instantiate_from_config(modelckpt_cfg)
+        trainer_kwargs["callbacks"] = [instantiate_from_config(modelckpt_cfg)]
+        trainer_kwargs["strategy"] = 'ddp_find_unused_parameters_true'
+        trainer_kwargs["default_root_dir"] = logdir
+
+        try:
+            profiler_config = OmegaConf.to_container(lightning_config.get('profiler', OmegaConf.create()))
+            if 'params' in profiler_config and 'schedule' in profiler_config['params']:
+                profiler_config['params']['schedule'] = instantiate_from_config(profiler_config['params']['schedule'])
+            trainer_kwargs["profiler"] = instantiate_from_config(profiler_config)
+        except:
+            pass
 
         # add callback which sets up log directory
         default_callbacks_cfg = {
@@ -549,11 +540,15 @@ if __name__ == "__main__":
                 }
             },
         }
-        callbacks_cfg = lightning_config.callbacks or OmegaConf.create()
+        try:
+            callbacks_cfg = lightning_config.callbacks
+        except:
+            callbacks_cfg = OmegaConf.create()
         callbacks_cfg = OmegaConf.merge(default_callbacks_cfg, callbacks_cfg)
-        trainer_kwargs["callbacks"] = [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
+        trainer_kwargs["callbacks"] += [instantiate_from_config(callbacks_cfg[k]) for k in callbacks_cfg]
+        trainer_kwargs |= trainer_config
 
-        trainer = Trainer.from_argparse_args(trainer_opt, **trainer_kwargs)
+        trainer = Trainer(**trainer_kwargs)
 
         # data
         data = instantiate_from_config(config.data)
@@ -566,10 +561,14 @@ if __name__ == "__main__":
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
         if not cpu:
-            ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
+            ngpu = len(lightning_config.trainer.devices.strip(",").split(','))
         else:
             ngpu = 1
-        accumulate_grad_batches = lightning_config.trainer.accumulate_grad_batches or 1
+
+        try:
+            accumulate_grad_batches = lightning_config.trainer.accumulate_grad_batches
+        except:
+            accumulate_grad_batches = 1
         print(f"accumulate_grad_batches = {accumulate_grad_batches}")
         lightning_config.trainer.accumulate_grad_batches = accumulate_grad_batches
         model.learning_rate = accumulate_grad_batches * ngpu * bs * trainer.num_nodes * base_lr
@@ -595,7 +594,13 @@ if __name__ == "__main__":
         # run
         if opt.train:
             try:
-                trainer.fit(model, data)
+                #compiled_model = torch.compile(model)
+                #trainer.fit(compiled_model, data)
+                try:
+                    resume_ckpt = config.model.params.ckpt_path
+                except:
+                    resume_ckpt = None
+                trainer.fit(model, data, ckpt_path=resume_ckpt)
             except Exception:
                 melk()
                 raise

@@ -71,7 +71,7 @@ class LPIPS(nn.Module):
         """
         n, c, h, w = x.size()
         features = x.view(n, c, w * h)
-        features_t = features.transpose(1, 2)
+        features_t = features.transpose(1, 2).contiguous() # fix stride warning
         gram = features.bmm(features_t) / (c * h * w)
         return gram
 
@@ -98,7 +98,8 @@ class NetLinLayer(nn.Module):
 class vgg16(torch.nn.Module):
     def __init__(self, requires_grad=False, pretrained=True):
         super(vgg16, self).__init__()
-        vgg_pretrained_features = models.vgg16(pretrained=pretrained).features
+        vgg_weights = models.VGG16_Weights.DEFAULT if pretrained else None
+        vgg_pretrained_features = models.vgg16(weights=vgg_weights).features
         self.slice1 = torch.nn.Sequential()
         self.slice2 = torch.nn.Sequential()
         self.slice3 = torch.nn.Sequential()
