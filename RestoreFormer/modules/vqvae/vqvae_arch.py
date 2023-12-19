@@ -1,8 +1,8 @@
+from basicsr.archs.stylegan2_arch import UpFirDnUpsample
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-torch.backends.cuda.enable_flash_sdp(True)
 
 class VectorQuantizer(nn.Module):
     """
@@ -15,7 +15,6 @@ class VectorQuantizer(nn.Module):
     - beta : commitment cost used in loss term, beta * ||z_e(x)-sg[e]||^2
     _____________________________________________
     """
-
     def __init__(self, n_e, e_dim, beta):
         super(VectorQuantizer, self).__init__()
         self.n_e = n_e
@@ -36,16 +35,16 @@ class VectorQuantizer(nn.Module):
             2. flatten input to (B*H*W,C)
         """
         # reshape z -> (batch, height, width, channel) and flatten
-        z = z.permute(0, 2, 3, 1).contiguous()
+        z = z.permute(0, 2, 3, 1)
 
-        z_flattened = z.view(-1, self.e_dim)
+        z_flattened = z.reshape(-1, self.e_dim)
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
         d = (z_flattened ** 2).sum(1, keepdim=True) + \
             (self.embedding.weight ** 2).sum(1) - 2 * \
             (z_flattened @ self.embedding.weight.t())
 
         min_encoding_indices = torch.argmin(d, dim=1)
-        z_q = self.embedding(min_encoding_indices).view(z.shape).contiguous()
+        z_q = self.embedding(min_encoding_indices).view(z.shape)
 
         # compute loss for embedding
         loss = torch.mean((z_q.detach()-z)**2) + self.beta * \
@@ -55,7 +54,7 @@ class VectorQuantizer(nn.Module):
         z_q = z + (z_q - z).detach()
 
         # reshape back to match original input shape
-        z_q = z_q.permute(0, 3, 1, 2).contiguous()
+        z_q = z_q.permute(0, 3, 1, 2).contiguous(memory_format=torch.contiguous_format)
         return z_q, loss, (None, None, min_encoding_indices, d)
 
     def get_codebook_entry(self, indices, shape):
@@ -66,7 +65,7 @@ class VectorQuantizer(nn.Module):
             z_q = z_q.view(shape)
 
             # reshape back to match original input shape
-            z_q = z_q.permute(0, 3, 1, 2).contiguous()
+            z_q = z_q.permute(0, 3, 1, 2).contiguous(memory_format=torch.contiguous_format)
 
         return z_q
 
@@ -77,19 +76,20 @@ class Normalize(nn.Module): # runs GroupNorm in FP32 because of float16 stabilit
         super().__init__()
         self.norm = nn.GroupNorm(num_groups, in_channels, eps=1e-6, affine=True)
     
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
     def forward(self, x):
-        return self.norm(x)
+        with torch.autocast('cuda', enabled=False):
+            return self.norm(x)
 
 class Upsample(nn.Module):
     def __init__(self, in_channels, with_conv):
         super().__init__()
         self.with_conv = with_conv
+        self.upsample = UpFirDnUpsample((1, 3, 3, 1))
         if self.with_conv:
             self.conv = torch.nn.Conv2d(in_channels, in_channels, 3, padding=1)
 
     def forward(self, x):
-        x = F.interpolate(x, scale_factor=2.0, mode="nearest")
+        x = self.upsample(x)
         if self.with_conv:
             x = self.conv(x)
         return x
@@ -110,10 +110,8 @@ class Downsample(nn.Module):
             x = F.avg_pool2d(x, kernel_size=2, stride=2)
         return x
 
-
 class ResnetBlock(nn.Module):
-    def __init__(self, in_channels, out_channels=None, conv_shortcut=False,
-                 dropout=0.0, temb_channels=512):
+    def __init__(self, in_channels, out_channels=None, conv_shortcut=False, dropout=0.0):
         super().__init__()
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
@@ -122,8 +120,6 @@ class ResnetBlock(nn.Module):
 
         self.norm1 = Normalize(in_channels)
         self.conv1 = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        if temb_channels > 0:
-            self.temb_proj = torch.nn.Linear(temb_channels, out_channels)
 
         self.norm2 = Normalize(out_channels)
         self.dropout = torch.nn.Dropout(dropout)
@@ -136,13 +132,9 @@ class ResnetBlock(nn.Module):
 
     def forward(self, x, temb):
         h = self.conv1(nonlinearity(self.norm1(x)))
-        if temb is not None:
-            h = h + self.temb_proj(nonlinearity(temb))[:,:,None,None]
         h = self.conv2(self.dropout(nonlinearity(self.norm2(h))))
-
         if self.in_channels != self.out_channels:
             x = self.conv_shortcut(x) if self.use_conv_shortcut else self.nin_shortcut(x)
-
         return x + h
 
 class MultiHeadAttnBlock(nn.Module):
@@ -164,7 +156,7 @@ class MultiHeadAttnBlock(nn.Module):
     def split_heads(self, x):
         B, _C, H, W = x.shape
         # B (hD) H W -> B h D (HW) -> B h (HW) D, D = d_head (self.att_size), h = num heads (self.head_size)
-        return x.reshape(B, self.head_size, self.att_size, H * W).permute(0, 1, 3, 2).contiguous()
+        return x.view(B, self.head_size, self.att_size, H * W).permute(0, 3, 1, 2).contiguous()
     
     def forward(self, x, y=None):
         B, C, H, W = x.shape
@@ -174,7 +166,7 @@ class MultiHeadAttnBlock(nn.Module):
 
         # compute attention
         att = F.scaled_dot_product_attention(q, k, v)
-        catted = att.permute(0, 1, 3, 2).reshape(B, C, H, W).contiguous() # M H N D -> M H D N -> B C H W
+        catted = att.transpose(2, 3).reshape(B, C, H, W).contiguous(memory_format=torch.contiguous_format) # M H N D -> M H D N -> B C H W
 
         return x + self.proj_out(catted)
 
@@ -196,12 +188,11 @@ class MultiHeadEncoder(nn.Module):
         block_out = self.ch
 
         curr_res = resolution
-        #in_ch_mult = (1,)+tuple(ch_mult)
         self.down = nn.ModuleList()
         for layer_idx, mult in enumerate(ch_mult):
             block_in, block_out = block_out, ch * mult
-            block = [ResnetBlock(block_in, block_out, temb_channels=0, dropout=dropout)]
-            block += [ResnetBlock(block_out, block_out, temb_channels=0, dropout=dropout) for _ in range(self.num_res_blocks-1)]
+            block = [ResnetBlock(block_in, block_out, dropout=dropout)]
+            block += [ResnetBlock(block_out, block_out, dropout=dropout) for _ in range(self.num_res_blocks-1)]
             attn = [MultiHeadAttnBlock(block_out, head_size) for _ in range(self.num_res_blocks)] if curr_res in attn_resolutions else []
             down = nn.Module()
             down.block = nn.ModuleList(block)
@@ -214,14 +205,13 @@ class MultiHeadEncoder(nn.Module):
         # middle
         if self.enable_mid:
             self.mid = nn.Module()
-            self.mid.block_1 = ResnetBlock(block_out, block_out, temb_channels=0, dropout=dropout)
+            self.mid.block_1 = ResnetBlock(block_out, block_out, dropout=dropout)
             self.mid.attn_1 = MultiHeadAttnBlock(block_out, head_size)
-            self.mid.block_2 = ResnetBlock(block_out, block_out, temb_channels=0, dropout=dropout)
+            self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
 
         # end
         self.norm_out = Normalize(block_out)
         self.conv_out = torch.nn.Conv2d(block_out, 2 * z_channels if double_z else z_channels, 3, padding=1)
-
 
     def forward(self, x):
         hs = {}
@@ -238,7 +228,6 @@ class MultiHeadEncoder(nn.Module):
                     h = self.down[i_level].attn[i_block](h)
 
             if i_level != self.num_resolutions-1:
-                # hs.append(h)
                 hs['block_'+str(i_level)] = h
                 h = self.down[i_level].downsample(h)
 
@@ -283,17 +272,16 @@ class MultiHeadDecoder(nn.Module):
         # middle
         if self.enable_mid:
             self.mid = nn.Module()
-            self.mid.block_1 = ResnetBlock(block_out, block_out, temb_channels=0, dropout=dropout)
+            self.mid.block_1 = ResnetBlock(block_out, block_out, dropout=dropout)
             self.mid.attn_1 = MultiHeadAttnBlock(block_out, head_size)
-            self.mid.block_2 = ResnetBlock(block_out, block_out, temb_channels=0, dropout=dropout)
+            self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
 
         # upsampling
         self.up = nn.ModuleList()
-        #for i_level in reversed(range(self.num_resolutions)):
         for layer_idx, mult in enumerate(reversed(ch_mult)):
             block_in, block_out = block_out, ch * mult
-            block = [ResnetBlock(block_in, block_out, temb_channels=0, dropout=dropout)]
-            block += [ResnetBlock(block_out, block_out, temb_channels=0, dropout=dropout) for _ in range(self.num_res_blocks)]
+            block = [ResnetBlock(block_in, block_out, dropout=dropout)]
+            block += [ResnetBlock(block_out, block_out, dropout=dropout) for _ in range(self.num_res_blocks)]
             attn = [MultiHeadAttnBlock(block_out, head_size) for _ in range(self.num_res_blocks + 1)] if curr_res in attn_resolutions else []
             up = nn.Module()
             up.block = nn.ModuleList(block)
@@ -308,7 +296,6 @@ class MultiHeadDecoder(nn.Module):
         self.conv_out = torch.nn.Conv2d(block_out, out_ch, 3, padding=1)
 
     def forward(self, z, hs=None):
-        #assert z.shape[1:] == self.z_shape[1:]
         self.last_z_shape = z.shape
 
         # timestep embedding
@@ -341,8 +328,9 @@ class MultiHeadDecoder(nn.Module):
         if self.give_pre_end:
             return h
 
-        h = self.conv_out(nonlinearity(self.norm_out(h)))
-        return h
+        penult = nonlinearity(self.norm_out(h))
+        h = self.conv_out(penult)
+        return h, penult
 
 MultiHeadDecoderTransformer = MultiHeadDecoder # for backwards compatibility
 
@@ -409,17 +397,17 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
 
     def decode(self, quant, hs=None):
         quant = self.post_quant_conv(quant)
-        dec = self.decoder(quant, hs)
-        return dec
+        dec, penult = self.decoder(quant, hs)
+        return dec, penult
 
     def forward(self, input, ref=None):
         quant, diff, info, hs = self.encode(input)
         if ref is not None:
             quant2, _diff, _info, _hs = self.encode(ref)
             quant = quant2
-        dec = self.decode(quant, hs)
+        dec, penult = self.decode(quant, hs)
 
-        return dec, diff, info, hs
+        return dec, diff, info, hs, penult
 
 class VQVAEGAN(VQVAEGANMultiHeadTransformer): # VQVAEGANMultiHeadTransformer but fix_encoder=False and ex_multi_scale_num=0
     # note: default values of init args are the same as VQVAEGANMultiHeadTransformer
@@ -450,10 +438,10 @@ class VQVAEGAN(VQVAEGANMultiHeadTransformer): # VQVAEGANMultiHeadTransformer but
 
     def decode(self, quant):
         quant = self.post_quant_conv(quant)
-        dec = self.decoder(quant)
-        return dec
+        dec, penult = self.decoder(quant)
+        return dec, penult
 
     def forward(self, input):
         quant, diff, info, hs = self.encode(input)
-        dec = self.decode(quant)
-        return dec, diff, info, hs
+        dec, penult = self.decode(quant)
+        return dec, diff, info, hs, penult

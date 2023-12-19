@@ -1,7 +1,8 @@
 import functools
 import torch.nn as nn
+import torch
 
-
+from basicsr.ops.fused_act import FusedLeakyReLU
 from RestoreFormer.modules.util import ActNorm
 
 
@@ -13,6 +14,14 @@ def weights_init(m):
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0)
 
+class Normalize(nn.Module): # runs GroupNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
+    def __init__(self, in_channels: int, num_groups: int = 32):
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups, in_channels, eps=1e-6, affine=True)
+    
+    def forward(self, x):
+        with torch.autocast('cuda', enabled=False):
+            return self.norm(x)
 
 class NLayerDiscriminator(nn.Module):
     """Defines a PatchGAN discriminator as in Pix2Pix
@@ -28,13 +37,16 @@ class NLayerDiscriminator(nn.Module):
         """
         super(NLayerDiscriminator, self).__init__()
         if not use_actnorm:
-            norm_layer = nn.BatchNorm2d
+            #norm_layer = nn.BatchNorm2d
+            norm_layer = Normalize
         else:
             norm_layer = ActNorm
         if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
-            use_bias = norm_layer.func != nn.BatchNorm2d
+            #use_bias = norm_layer.func != nn.BatchNorm2d
+            use_bias = norm_layer.func != Normalize
         else:
-            use_bias = norm_layer != nn.BatchNorm2d
+            #use_bias = norm_layer != nn.BatchNorm2d
+            use_bias = norm_layer != Normalize
 
         kw = 4
         padw = 1
@@ -137,4 +149,3 @@ class NLayerDiscriminator_v1(nn.Module):
         final = self.final(beforlastF)
 
         return features, final
-

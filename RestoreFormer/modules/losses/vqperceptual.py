@@ -39,11 +39,10 @@ def vanilla_d_loss(logits_real, logits_fake):
         torch.mean(torch.nn.functional.softplus(logits_fake)))
     return d_loss
 
-
 class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
     def __init__(self, disc_start, codebook_weight=1.0, pixelloss_weight=1.0,
                  disc_num_layers=3, disc_in_channels=3, disc_factor=1.0, disc_weight=1.0,
-                 perceptual_weight=1.0, use_actnorm=False, 
+                 max_discriminator_weight=1e4, perceptual_weight=1.0, use_actnorm=False, 
                  disc_ndf=64, disc_loss="hinge", comp_weight=0.0, comp_style_weight=0.0, 
                  identity_weight=0.0, comp_disc_loss='vanilla', lpips_style_weight=0.0,
                  identity_model_path=None, **ignore_kwargs):
@@ -51,18 +50,18 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         assert disc_loss in ["hinge", "vanilla"]
         self.codebook_weight = codebook_weight
         self.pixel_weight = pixelloss_weight
-        self.perceptual_loss = LPIPS(style_weight=lpips_style_weight).eval()
+        self.perceptual_loss = LPIPS(style_weight=lpips_style_weight).to(memory_format=torch.contiguous_format).eval()
         self.perceptual_weight = perceptual_weight
 
         self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels,
                                                  n_layers=disc_num_layers,
                                                  use_actnorm=use_actnorm,
                                                  ndf=disc_ndf
-                                                 ).apply(weights_init)
+                                                 ).apply(weights_init).to(memory_format=torch.contiguous_format)
         if comp_weight > 0:
-            self.net_d_left_eye = FacialComponentDiscriminator()
-            self.net_d_right_eye = FacialComponentDiscriminator()
-            self.net_d_mouth = FacialComponentDiscriminator()
+            self.net_d_left_eye = FacialComponentDiscriminator().to(memory_format=torch.contiguous_format)
+            self.net_d_right_eye = FacialComponentDiscriminator().to(memory_format=torch.contiguous_format)
+            self.net_d_mouth = FacialComponentDiscriminator().to(memory_format=torch.contiguous_format)
             print(f'Use components discrimination')
 
             self.cri_component = GANLoss(gan_type=comp_disc_loss, 
@@ -76,7 +75,7 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         if identity_weight > 0:
             self.identity = ResNetArcFace(block = 'IRBlock', 
                                           layers = [2, 2, 2, 2],
-                                          use_se = False)
+                                          use_se = False).to(memory_format=torch.contiguous_format)
             print(f'Use identity loss')
             if identity_model_path is not None:
                 sd = torch.load(identity_model_path, map_location="cpu")
@@ -99,21 +98,20 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
             self.disc_loss = vanilla_d_loss
         else:
             raise ValueError(f"Unknown GAN loss '{disc_loss}'.")
-        print(f"VQLPIPSWithDiscriminatorWithCompWithIdentity running with {disc_loss} loss.")
+        print(f"VQLPIPSWithDiscriminatorWithCompWithIdentity running with {disc_loss} loss, d_factor: {disc_factor}, d_weight: {disc_weight}")
         self.disc_factor = disc_factor
         self.discriminator_weight = disc_weight
+        self.max_discriminator_weight = max_discriminator_weight
         self.comp_weight = comp_weight
         self.comp_style_weight = comp_style_weight
         self.identity_weight = identity_weight
         self.lpips_style_weight = lpips_style_weight
 
     def calculate_adaptive_weight(self, nll_loss, g_loss, last_layer=None):
-        if last_layer is not None:
-            nll_grads = torch.autograd.grad(nll_loss, last_layer, retain_graph=True)[0]
-            g_grads = torch.autograd.grad(g_loss, last_layer, retain_graph=True)[0]
-        else:
-            nll_grads = torch.autograd.grad(nll_loss, self.last_layer[0], retain_graph=True)[0]
-            g_grads = torch.autograd.grad(g_loss, self.last_layer[0], retain_graph=True)[0]
+        if last_layer is None:
+            last_layer = self.last_layer[0]
+        nll_grads = torch.autograd.grad(nll_loss, last_layer.weight, retain_graph=True)[0]
+        g_grads = torch.autograd.grad(g_loss, last_layer.weight, retain_graph=True)[0]
 
         d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
         d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
@@ -141,141 +139,133 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         out_gray = F.interpolate(out_gray, (size, size), mode='bilinear', align_corners=False)
         return out_gray
 
-    def forward(self, codebook_loss, gts, reconstructions, components, optimizer_idx,
-                global_step, last_layer=None, split="train"):
-
+    def forward(self, codebook_loss, gts, reconstructions, components,
+                global_step, last_layer=None, penult=None, split="train"):
         # now the GAN part
-        if optimizer_idx == 0:
-            rec_loss = (torch.abs(gts.contiguous() - reconstructions.contiguous())) * self.pixel_weight
-            if self.perceptual_weight > 0:
-                p_loss, p_style_loss = self.perceptual_loss(gts.contiguous(), reconstructions.contiguous())
-                rec_loss = rec_loss + self.perceptual_weight * p_loss
-            else:
-                p_loss = torch.tensor([0.0])
-                p_style_loss = torch.tensor([0.0])
+        rec_loss = (torch.abs(gts.contiguous(memory_format=torch.contiguous_format) - reconstructions.contiguous(memory_format=torch.contiguous_format))) * self.pixel_weight
+        if self.perceptual_weight > 0:
+            p_loss, p_style_loss = self.perceptual_loss(gts.contiguous(memory_format=torch.contiguous_format), reconstructions.contiguous(memory_format=torch.contiguous_format))
+            rec_loss = rec_loss + self.perceptual_weight * p_loss
+        else:
+            p_loss = torch.tensor([0.0])
+            p_style_loss = torch.tensor([0.0])
 
-            nll_loss = rec_loss
-            #nll_loss = torch.sum(nll_loss) / nll_loss.shape[0]
-            nll_loss = torch.mean(nll_loss)
+        nll_loss = rec_loss
+        nll_loss = torch.mean(nll_loss)
+    
+        # generator update
+        logits_fake = self.discriminator(reconstructions.contiguous(memory_format=torch.contiguous_format))
+        g_loss = -torch.mean(logits_fake)
 
-        
-            # generator update
-            
-            logits_fake = self.discriminator(reconstructions.contiguous())
-            g_loss = -torch.mean(logits_fake)
-
-            try:
+        try:
+            if penult is None:
                 d_weight = self.calculate_adaptive_weight(nll_loss, g_loss, last_layer=last_layer)
-            except RuntimeError:
-                assert not self.training
-                d_weight = torch.tensor(0.0)
+            else:
+                nll_grads = torch.autograd.grad(nll_loss, last_layer.weight, retain_graph=True)[0]
 
-            disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
+                reconstructions_adv = last_layer(penult.detach())
+                logits_fake_tmp = self.discriminator(reconstructions_adv.contiguous(memory_format=torch.contiguous_format))
+                g_loss_tmp = -torch.mean(logits_fake_tmp)
+                g_grads = torch.autograd.grad(g_loss_tmp, last_layer.weight, retain_graph=False)[0]
+
+                d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
+                d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
+                d_weight *= self.discriminator_weight
+        except RuntimeError:
+            assert not self.training
+            d_weight = torch.tensor(0.0)
+
+        disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
+        loss = nll_loss + d_weight.clamp(0, self.max_discriminator_weight) * disc_factor * g_loss + self.codebook_weight * codebook_loss.mean() + p_style_loss
+
+        log = {
+                f"{split}/quant_loss": codebook_loss.detach().mean(),
+                f"{split}/nll_loss": nll_loss.detach().mean(),
+                f"{split}/rec_loss": rec_loss.detach().mean(),
+                f"{split}/p_loss": p_loss.detach().mean(),
+                f"{split}/p_style_loss": p_style_loss.detach().mean(),
+                f"{split}/d_weight": d_weight.detach(),
+                f"{split}/disc_factor": torch.tensor(disc_factor),
+                f"{split}/g_loss": g_loss.detach().mean(),
+                }
+
+        d_left_eye_loss = d_right_eye_loss = d_mouth_loss = 0.0
+        if self.comp_weight > 0. and components is not None and self.discriminator_iter_start < global_step:
+            # left eye disc
+            fake_left_eye, fake_left_eye_feats = self.net_d_left_eye(components['left_eyes'], return_feats=True)
+            g_left_loss = self.cri_component(fake_left_eye, True, is_disc=False)
+
+            real_left_eye, _real_left_eye_feats = self.net_d_left_eye(components['left_eyes_gt'])
+            fake_left_eye, _fake_left_eye_feats = self.net_d_left_eye(components['left_eyes'].detach(), return_feats=True)
+            d_left_eye_loss = self.cri_component(real_left_eye, True, is_disc=True) + self.cri_component(fake_left_eye, False, is_disc=True)
+
+            # right eye disc
+            fake_right_eye, fake_right_eye_feats = self.net_d_right_eye(components['right_eyes'], return_feats=True)
+            g_right_loss = self.cri_component(fake_right_eye, True, is_disc=False)
+
+            real_right_eye, _real_right_eye_feats = self.net_d_right_eye(components['right_eyes_gt'])
+            fake_right_eye, _fake_right_eye_feats = self.net_d_right_eye(components['right_eyes'].detach(), return_feats=True)
+            d_right_eye_loss = self.cri_component(real_right_eye, True, is_disc=True) + self.cri_component(fake_right_eye, False, is_disc=True)
+
+            # mouth disc
+            fake_mouth, fake_mouth_feats = self.net_d_mouth(components['mouths'], return_feats=True)
+            g_mouth_loss = self.cri_component(fake_mouth, True, is_disc=False)
+
+            real_mouth, _real_mouth_feats = self.net_d_mouth(components['mouths_gt'])
+            fake_mouth, _fake_mouth_feats = self.net_d_mouth(components['mouths'].detach(), return_feats=True)
+            d_mouth_loss = self.cri_component(real_mouth, True, is_disc=True) + self.cri_component(fake_mouth, False, is_disc=True)
             
-            loss = nll_loss + d_weight * disc_factor * g_loss + self.codebook_weight * codebook_loss.mean() + p_style_loss
+            loss += g_left_loss + g_right_loss + g_mouth_loss
 
-            log = {
-                   "{}/quant_loss".format(split): codebook_loss.detach().mean(),
-                   "{}/nll_loss".format(split): nll_loss.detach().mean(),
-                   "{}/rec_loss".format(split): rec_loss.detach().mean(),
-                   "{}/p_loss".format(split): p_loss.detach().mean(),
-                   "{}/p_style_loss".format(split): p_style_loss.detach().mean(),
-                   "{}/d_weight".format(split): d_weight.detach(),
-                   "{}/disc_factor".format(split): torch.tensor(disc_factor),
-                   "{}/g_loss".format(split): g_loss.detach().mean(),
-                   }
+            log.update({
+                f"{split}/g_left_loss": g_left_loss.detach(),
+                f"{split}/d_left_loss": d_loss.clone().detach().mean(),
+                f"{split}/d_right_loss": d_loss.clone().detach().mean(),
+                f"{split}/g_right_loss": g_right_loss.detach(),
+                f"{split}/d_mouth_loss": d_loss.clone().detach().mean(),
+                f"{split}/g_mouth_loss": g_mouth_loss.detach(),
+            })
 
-            if self.comp_weight > 0. and components is not None and self.discriminator_iter_start < global_step:
-                fake_left_eye, fake_left_eye_feats = self.net_d_left_eye(components['left_eyes'], return_feats=True)
-                comp_g_loss = self.cri_component(fake_left_eye, True, is_disc=False)
-                loss = loss + comp_g_loss 
-                log["{}/g_left_loss".format(split)] = comp_g_loss.detach()
+            if self.comp_style_weight > 0.:
+                def _comp_style(feat, feat_gt, criterion):
+                    return criterion(self._gram_mat(feat[0]), self._gram_mat(
+                        feat_gt[0].detach())) * 0.5 + criterion(self._gram_mat(
+                        feat[1]), self._gram_mat(feat_gt[1].detach()))
 
-                fake_right_eye, fake_right_eye_feats = self.net_d_right_eye(components['right_eyes'], return_feats=True)
-                comp_g_loss = self.cri_component(fake_right_eye, True, is_disc=False)
-                loss = loss + comp_g_loss 
-                log["{}/g_right_loss".format(split)] = comp_g_loss.detach()
+                _real_left_eye, real_left_eye_feats = self.net_d_left_eye(components['left_eyes_gt'])
+                _real_right_eye, real_right_eye_feats = self.net_d_right_eye(components['right_eyes_gt'])
+                _real_mouth, real_mouth_feats = self.net_d_mouth(components['mouths_gt'])
 
-                fake_mouth, fake_mouth_feats = self.net_d_mouth(components['mouths'], return_feats=True)
-                comp_g_loss = self.cri_component(fake_mouth, True, is_disc=False)
-                loss = loss + comp_g_loss 
-                log["{}/g_mouth_loss".format(split)] = comp_g_loss.detach()
+                comp_style_loss = 0.
+                comp_style_loss += _comp_style(fake_left_eye_feats, real_left_eye_feats, self.cri_style)
+                comp_style_loss += _comp_style(fake_right_eye_feats, real_right_eye_feats, self.cri_style)
+                comp_style_loss += _comp_style(fake_mouth_feats, real_mouth_feats, self.cri_style)
+                loss = loss + comp_style_loss 
+                log["{}/comp_style_loss".format(split)] = comp_style_loss.detach()
 
-                if self.comp_style_weight > 0.:
-                    _, real_left_eye_feats = self.net_d_left_eye(components['left_eyes_gt'], return_feats=True)
-                    _, real_right_eye_feats = self.net_d_right_eye(components['right_eyes_gt'], return_feats=True)
-                    _, real_mouth_feats = self.net_d_mouth(components['mouths_gt'], return_feats=True)
-
-                    def _comp_style(feat, feat_gt, criterion):
-                        return criterion(self._gram_mat(feat[0]), self._gram_mat(
-                            feat_gt[0].detach())) * 0.5 + criterion(self._gram_mat(
-                            feat[1]), self._gram_mat(feat_gt[1].detach()))
-
-                    comp_style_loss = 0.
-                    comp_style_loss = comp_style_loss + _comp_style(fake_left_eye_feats, real_left_eye_feats, self.cri_style)
-                    comp_style_loss = comp_style_loss + _comp_style(fake_right_eye_feats, real_right_eye_feats, self.cri_style)
-                    comp_style_loss = comp_style_loss + _comp_style(fake_mouth_feats, real_mouth_feats, self.cri_style)
-                    loss = loss + comp_style_loss 
-                    log["{}/comp_style_loss".format(split)] = comp_style_loss.detach()
-
-            if self.identity_weight > 0. and self.discriminator_iter_start < global_step:
-                self.identity.eval()
-                out_gray = self.gray_resize_for_identity(reconstructions)
-                gt_gray = self.gray_resize_for_identity(gts)
-                
-                identity_gt = self.identity(gt_gray).detach()
-                identity_out = self.identity(out_gray)
-
-                identity_loss = self.cri_identity(identity_out, identity_gt)
-                loss = loss + identity_loss 
-                log["{}/identity_loss".format(split)] = identity_loss.detach()
-
-            log["{}/total_loss".format(split)] = loss.clone().detach().mean()
-
-            return loss, log
-
-        if optimizer_idx == 1:
-            # second pass for discriminator update
+        if self.identity_weight > 0. and self.discriminator_iter_start < global_step:
+            self.identity.eval()
+            out_gray = self.gray_resize_for_identity(reconstructions)
+            gt_gray = self.gray_resize_for_identity(gts)
             
-            logits_real = self.discriminator(gts.contiguous().detach())
-            logits_fake = self.discriminator(reconstructions.contiguous().detach())
+            identity_gt = self.identity(gt_gray).detach()
+            identity_out = self.identity(out_gray)
 
-            disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
-            d_loss = disc_factor * self.disc_loss(logits_real, logits_fake)
+            identity_loss = self.cri_identity(identity_out, identity_gt)
+            loss = loss + identity_loss 
+            log["{}/identity_loss".format(split)] = identity_loss.detach()
 
-            log = {"{}/disc_loss".format(split): d_loss.clone().detach().mean(),
-                   "{}/logits_real".format(split): logits_real.detach().mean(),
-                   "{}/logits_fake".format(split): logits_fake.detach().mean()
-                   }
-            return d_loss, log
+        log["{}/total_loss".format(split)] = loss.clone().detach().mean()
 
-        # left eye
-        if optimizer_idx == 2:
-            # third pass for discriminator update
-            disc_factor = adopt_weight(1.0, global_step, threshold=self.discriminator_iter_start)
-            fake_d_pred, _ = self.net_d_left_eye(components['left_eyes'].detach())
-            real_d_pred, _ = self.net_d_left_eye(components['left_eyes_gt'])
-            d_loss = self.cri_component(real_d_pred, True, is_disc=True) + self.cri_component(fake_d_pred, False, is_disc=True)
+        # second pass for discriminator update
+        logits_fake = self.discriminator(reconstructions.contiguous(memory_format=torch.contiguous_format).detach())
+        logits_real = self.discriminator(gts.contiguous(memory_format=torch.contiguous_format).detach())
+        disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
+        d_loss = disc_factor * self.disc_loss(logits_real, logits_fake)
 
-            log = {"{}/d_left_loss".format(split): d_loss.clone().detach().mean()}
-            return d_loss, log
+        log.update({"{}/disc_loss".format(split): d_loss.clone().detach().mean(),
+                "{}/logits_real".format(split): logits_real.detach().mean(),
+                "{}/logits_fake".format(split): logits_fake.detach().mean()
+                })
 
-        # right eye
-        if optimizer_idx == 3:
-            # forth pass for discriminator update
-            fake_d_pred, _ = self.net_d_right_eye(components['right_eyes'].detach())
-            real_d_pred, _ = self.net_d_right_eye(components['right_eyes_gt'])
-            d_loss = self.cri_component(real_d_pred, True, is_disc=True) + self.cri_component(fake_d_pred, False, is_disc=True)
-
-            log = {"{}/d_right_loss".format(split): d_loss.clone().detach().mean()}
-            return d_loss, log
-
-        # mouth
-        if optimizer_idx == 4:
-            # fifth pass for discriminator update
-            fake_d_pred, _ = self.net_d_mouth(components['mouths'].detach())
-            real_d_pred, _ = self.net_d_mouth(components['mouths_gt'])
-            d_loss = self.cri_component(real_d_pred, True, is_disc=True) + self.cri_component(fake_d_pred, False, is_disc=True)
-
-            log = {"{}/d_mouth_loss".format(split): d_loss.clone().detach().mean()}
-            return d_loss, log
+        return loss, d_loss, d_left_eye_loss, d_right_eye_loss, d_mouth_loss, log

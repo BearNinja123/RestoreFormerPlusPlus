@@ -6,7 +6,6 @@ def count_params(model):
     total_params = sum(p.numel() for p in model.parameters())
     return total_params
 
-
 class ActNorm(nn.Module):
     def __init__(self, num_features, logdet=False, affine=True,
                  allow_reverse_init=False):
@@ -28,7 +27,7 @@ class ActNorm(nn.Module):
                 .unsqueeze(2)
                 .unsqueeze(3)
                 .permute(1, 0, 2, 3)
-                .contiguous() # fix stride warning
+                .contiguous(memory_format=torch.contiguous_format) # fix stride warning
             )
             std = (
                 flatten.std(1)
@@ -36,7 +35,7 @@ class ActNorm(nn.Module):
                 .unsqueeze(2)
                 .unsqueeze(3)
                 .permute(1, 0, 2, 3)
-                .contiguous() # fix stride warning
+                .contiguous(memory_format=torch.contiguous_format) # fix stride warning
             )
 
             self.loc.data.copy_(-mean)

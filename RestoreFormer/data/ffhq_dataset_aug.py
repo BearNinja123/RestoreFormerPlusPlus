@@ -9,7 +9,7 @@ from basicsr.utils import FileClient, get_root_logger, imfrombytes, img2tensor
 from basicsr.utils.registry import DATASET_REGISTRY
 from basicsr.data.data_util import paths_from_folder
 
-import cv2
+import cv2, torch
 import numpy as np
 
 # @DATASET_REGISTRY.register()
