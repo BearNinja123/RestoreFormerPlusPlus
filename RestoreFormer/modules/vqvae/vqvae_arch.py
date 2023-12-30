@@ -3,6 +3,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True) # apparently this is as fast as flash attn but more flexible
 
 class VectorQuantizer(nn.Module):
     """
@@ -54,7 +57,7 @@ class VectorQuantizer(nn.Module):
         z_q = z + (z_q - z).detach()
 
         # reshape back to match original input shape
-        z_q = z_q.permute(0, 3, 1, 2).contiguous(memory_format=torch.contiguous_format)
+        z_q = z_q.permute(0, 3, 1, 2) #.contiguous(memory_format=torch.channels_last)
         return z_q, loss, (None, None, min_encoding_indices, d)
 
     def get_codebook_entry(self, indices, shape):
@@ -65,16 +68,17 @@ class VectorQuantizer(nn.Module):
             z_q = z_q.view(shape)
 
             # reshape back to match original input shape
-            z_q = z_q.permute(0, 3, 1, 2).contiguous(memory_format=torch.contiguous_format)
+            z_q = z_q.permute(0, 3, 1, 2) #.contiguous(memory_format=torch.channels_last)
 
         return z_q
 
 nonlinearity = F.silu
 
-class Normalize(nn.Module): # runs GroupNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
+class Normalize(nn.Module): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
     def __init__(self, in_channels: int, num_groups: int = 32):
         super().__init__()
-        self.norm = nn.GroupNorm(num_groups, in_channels, eps=1e-6, affine=True)
+        self.norm = nn.BatchNorm2d(in_channels, eps=1e-6, affine=True)
+        #self.norm = nn.GroupNorm(num_groups, in_channels, eps=1e-6, affine=True)
     
     def forward(self, x):
         with torch.autocast('cuda', enabled=False):
@@ -84,12 +88,13 @@ class Upsample(nn.Module):
     def __init__(self, in_channels, with_conv):
         super().__init__()
         self.with_conv = with_conv
-        self.upsample = UpFirDnUpsample((1, 3, 3, 1))
+        #self.upsample = UpFirDnUpsample((1, 3, 3, 1))
         if self.with_conv:
             self.conv = torch.nn.Conv2d(in_channels, in_channels, 3, padding=1)
 
     def forward(self, x):
-        x = self.upsample(x)
+        #x = self.upsample(x)
+        x = F.interpolate(x, scale_factor=2.0) #, mode='bilinear')
         if self.with_conv:
             x = self.conv(x)
         return x
@@ -156,7 +161,7 @@ class MultiHeadAttnBlock(nn.Module):
     def split_heads(self, x):
         B, _C, H, W = x.shape
         # B (hD) H W -> B h D (HW) -> B h (HW) D, D = d_head (self.att_size), h = num heads (self.head_size)
-        return x.view(B, self.head_size, self.att_size, H * W).permute(0, 3, 1, 2).contiguous()
+        return x.view(B, self.head_size, self.att_size, H * W).permute(0, 3, 1, 2) #.contiguous()
     
     def forward(self, x, y=None):
         B, C, H, W = x.shape
@@ -166,7 +171,7 @@ class MultiHeadAttnBlock(nn.Module):
 
         # compute attention
         att = F.scaled_dot_product_attention(q, k, v)
-        catted = att.transpose(2, 3).reshape(B, C, H, W).contiguous(memory_format=torch.contiguous_format) # M H N D -> M H D N -> B C H W
+        catted = att.transpose(2, 3).reshape(B, C, H, W) #.contiguous(memory_format=torch.channels_last) # M H N D -> M H D N -> B C H W
 
         return x + self.proj_out(catted)
 
