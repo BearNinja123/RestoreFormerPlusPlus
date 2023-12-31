@@ -1,12 +1,16 @@
 #include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
+#include <ATen/native/cuda/Loops.cuh>
+#include <c10/core/DeviceType.h>
+#include <c10/core/ScalarType.h>
 #include <c10/cuda/CUDAMathCompat.h> // rsqrt
 #include <ATen/AccumulateType.h> // acc_type
+#include <string>
 #include <torch/extension.h>
 #include <cuda_runtime.h>
 #include <thrust/pair.h>
 #include <cuda.h>
 #include <vector>
-#define THREADS_PER_BLOCK 128
+#define THREADS_PER_BLOCK 1024
 
 // Reduces a value across the y-threads of a threadblock
 template <typename T, class ReduceOp>
@@ -20,7 +24,7 @@ y_reduce(
   int tid = threadIdx.y * blockDim.x + threadIdx.x;
   output_buffer[tid] = val;
   __syncthreads();
-  for (int stride = (int)(blockDim.x * blockDim.y / 2); stride < (int)blockDim.x; stride >>= 1) {
+  for (int stride = (int)(blockDim.x * blockDim.y / 2); stride >= (int)blockDim.x; stride >>= 1) {
     if (tid < stride)
       output_buffer[tid] = op.combine(output_buffer[tid], output_buffer[tid + stride]);
     __syncthreads();
@@ -51,14 +55,12 @@ compute_stats(
     val = welford_op.reduce(val, static_cast<T_ACC>(x), i); // check last arg, probably wrong
   }
 
-  //__shared__ WelfordType vals_reduced[blockDim.y][blockDim.x];
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[THREADS_PER_BLOCK];
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
-  //y_reduce(val, welford_op, WelfordType(0, 0, 0, 0), vals_reduced);
   y_reduce(val, welford_op, vals_reduced);
   if (threadIdx.y == 0) {
     T_ACC m1, m2;
-    thrust::tie(m2, m1) = welford_op.project(val);
+    thrust::tie(m2, m1) = welford_op.project(vals_reduced[threadIdx.x]);
     means[blockIdx.x * G + threadIdx.x] = m1;
     rstds[blockIdx.x * G + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
   }
@@ -74,6 +76,7 @@ void gn_nhwc_forward_kernel(
     torch::Tensor& Y,
     torch::Tensor& means,
     torch::Tensor& rstds) {
+  using T_ACC = at::acc_type<T, true>;
   const T* X_data = X.const_data_ptr<T>();
   T* mean_data = means.mutable_data_ptr<T>();
   T* rstd_data = rstds.mutable_data_ptr<T>();
@@ -87,7 +90,7 @@ void gn_nhwc_forward_kernel(
   const int d = D / g;
 
   const dim3 dimGrid(N);
-  const dim3 dimBlock(G, THREADS_PER_BLOCK / G);
+  const dim3 dimBlock(G, g);
   compute_stats<T><<<dimGrid, dimBlock>>>(
       X_data, G, H * W * d, eps,
       mean_data, rstd_data
@@ -103,12 +106,11 @@ void gn_nhwc_forward_kernel(
     .add_owned_input(bias.view({1, 1, D, G}))
     .build();
 
-  gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T weight, T bias) -> T {
+  at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T weight, T bias) -> T {
       return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) * static_cast<T_ACC>(rstd) * static_cast<T_ACC>(weight) + static_cast<T_ACC>(bias);
       });
-  //AT_CUDA_CHECK(cudaGetLastError());
+  AT_CUDA_CHECK(cudaGetLastError());
 }
-
 
 std::vector<torch::Tensor> gn_nhwc_cuda_forward(
     const torch::Tensor& X,
@@ -127,7 +129,7 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward(
     at::ScalarType::Half,
     at::ScalarType::BFloat16,
     X.scalar_type(),
-    "group_norm_nhwc_forward", ([&] {
+    "group_norm_nhwc_forward", [&]() {
       gn_nhwc_forward_kernel<scalar_t>(
           X_nhwc,
           weight,
@@ -138,7 +140,7 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward(
           means,
           rstds
       );
-  }));
+  });
   return {X_out.permute({0, 3, 1, 2}), means, rstds};
 }
 
@@ -152,7 +154,7 @@ y_sum_reduce(
   int tid = threadIdx.y * blockDim.x + threadIdx.x;
   output_buffer[tid] = val;
   __syncthreads();
-  for (int stride = (int)(blockDim.x * blockDim.y / 2); stride < (int)blockDim.x; stride >>= 1) {
+  for (int stride = (int)(blockDim.x * blockDim.y / 2); stride >= (int)blockDim.x; stride >>= 1) {
     if (tid < stride)
       output_buffer[tid] = output_buffer[tid] + output_buffer[tid + stride];
     __syncthreads();
@@ -220,12 +222,15 @@ backward_weight_bias(
   using T_ACC = at::acc_type<T, true>;
   T_ACC dweight_sum = 0;
   T_ACC dbias_sum = 0;
+
   const int c = THREADS_PER_BLOCK / C;
   const int Hw = HW / c;
-  const int ng = blockIdx.x * G * threadIdx.x % G; // [bix][i][ty][tx]
+  const int ng = blockIdx.x * G + threadIdx.x % G; // [bix][i][ty][tx]
 
   for (int i = 0; i < Hw; ++i) {
-    int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.z * C + threadIdx.x; // [bix][i][ty][tx]
+  //for (int i = 0; i < 1; ++i) {
+    int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
+    //int index = threadIdx.x; // [bix][i][ty][tx]
     T_ACC dy_elem = static_cast<T_ACC>(dy[index]);
     dweight_sum += dy_elem * (static_cast<T_ACC>(X[index]) - static_cast<T_ACC>(means[ng])) * static_cast<T_ACC>(rstds[ng]);
     dbias_sum += dy_elem;
@@ -239,6 +244,8 @@ backward_weight_bias(
   if (threadIdx.y == 0) {
     dweight[threadIdx.x] = reduced_dweight[threadIdx.x];
     dbias[threadIdx.x] = reduced_dbias[threadIdx.x];
+    //dweight[threadIdx.x] = dweight_sum;
+    //dbias[threadIdx.x] = dbias_sum;
   }
 }
 
@@ -254,8 +261,8 @@ void gn_nhwc_backward_kernel(
     torch::Tensor& dweight,
     torch::Tensor& dbias) {
   using T_ACC = at::acc_type<T, true>;
-  const T* X_data = X_nhwc.const_data_ptr<T>();
   const T* dy_data = dy_nhwc.const_data_ptr<T>();
+  const T* X_data = X_nhwc.const_data_ptr<T>();
   const T* weight_data = weight.const_data_ptr<T>();
   const T* mean_data = means.const_data_ptr<T>();
   const T* rstd_data = rstds.const_data_ptr<T>();
@@ -268,7 +275,6 @@ void gn_nhwc_backward_kernel(
   const int C = X_nhwc.size(3);
   const int D = C / G;
   const int g = THREADS_PER_BLOCK / G;
-  const int d = D / g;
 
   torch::Tensor coef2 = at::empty({N, G}, X_nhwc.options());
   torch::Tensor coef3 = at::empty({N, G}, X_nhwc.options());
@@ -276,7 +282,7 @@ void gn_nhwc_backward_kernel(
   T_ACC* coef3_data = coef3.mutable_data_ptr<T_ACC>();
 
   const dim3 dimGrid(N);
-  const dim3 dimBlock(G, THREADS_PER_BLOCK / G);
+  const dim3 dimBlock(G, g);
   compute_backward_params<T><<<dimGrid, dimBlock>>>(
       dy_data, X_data, mean_data, rstd_data, weight_data,
       H * W * D, G,
@@ -285,25 +291,26 @@ void gn_nhwc_backward_kernel(
 
   at::TensorIterator iter = at::TensorIteratorConfig()
     .resize_outputs(false)
-    .add_owned_output(dx.view({N, H * W * D, G}))
-    .add_owned_input(dy_nhwc.view({N, H * W * D, G}))
-    .add_owned_input(X_nhwc.view({N, H * W * D, G}))
-    .add_owned_input(means.view({N, 1, G}))
-    .add_owned_input(rstds.view({N, 1, G}))
-    .add_owned_input(coef2.view({N, 1, G}))
-    .add_owned_input(coef3.view({N, 1, G}))
+    .add_owned_output(dx.view({N, H * W, D, G}))
+    .add_owned_input(dy_nhwc.view({N, H * W, D, G}))
+    .add_owned_input(X_nhwc.view({N, H * W, D, G}))
+    .add_owned_input(weight.view({1, 1, D, G}))
+    .add_owned_input(rstds.view({N, 1, 1, G}))
+    .add_owned_input(coef2.view({N, 1, 1, G}))
+    .add_owned_input(coef3.view({N, 1, 1, G}))
     .build();
 
-  gpu_kernel(iter, [] GPU_LAMBDA(T dy, T x, T weight, T rstd, T coef2, T coef3) -> T {
+  at::native::gpu_kernel(iter, [] GPU_LAMBDA(T dy, T x, T weight, T rstd, T_ACC coef2, T_ACC coef3) -> T {
       const T_ACC c1 = static_cast<T_ACC>(rstd) * static_cast<T_ACC>(weight);
-      return (c1 * static_cast<T_ACC>(dy)) + (static_cast<T_ACC>(c2) * static_cast<T_ACC>(x)) + static_cast<T_ACC>(c3);
+      return (c1 * static_cast<T_ACC>(dy)) + (coef2 * static_cast<T_ACC>(x)) + coef3;
     });
 
   backward_weight_bias<T><<<N, dim3(C, THREADS_PER_BLOCK / C)>>>(
       dy_data, X_data, mean_data, rstd_data, 
       H * W, C, G,
       dweight_data, dbias_data);
-  //AT_CUDA_CHECK(cudaGetLastError());
+
+  AT_CUDA_CHECK(cudaGetLastError());
 }
 
 std::vector<torch::Tensor> gn_nhwc_cuda_backward(
@@ -313,17 +320,18 @@ std::vector<torch::Tensor> gn_nhwc_cuda_backward(
     const torch::Tensor& means,
     const torch::Tensor& rstds,
     const int G) {
-  torch::Tensor X_nhwc = X.permute({0, 2, 3, 1});
-  torch::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
-  torch::Tensor dx = torch::zeros_like(dy);
-  torch::Tensor dgamma = torch::zeros({G}).to(dy.device());
-  torch::Tensor dbeta = torch::zeros({G}).to(dy.device());
+  const int C = X.size(1);
+  const torch::Tensor X_nhwc = X.permute({0, 2, 3, 1});
+  const torch::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
+  torch::Tensor dx = torch::zeros_like(dy_nhwc);
+  torch::Tensor dgamma = torch::zeros({C}).to(dy.device());
+  torch::Tensor dbeta = torch::zeros({C}).to(dy.device());
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
     at::ScalarType::Half,
     at::ScalarType::BFloat16,
-    dy.scalar_type(),
-    "group_norm_nhwc_backward", ([&] {
+    X.scalar_type(),
+    "group_norm_nhwc_backward", [&]() {
       gn_nhwc_backward_kernel<scalar_t>(
           dy_nhwc,
           X_nhwc,
@@ -335,6 +343,7 @@ std::vector<torch::Tensor> gn_nhwc_cuda_backward(
           dgamma,
           dbeta
       );
-  }));
+  });
+
   return {dx.permute({0, 3, 1, 2}), dgamma, dbeta};
 }

@@ -32,20 +32,20 @@ std::vector<torch::Tensor> gn_nhwc_forward(
 
 std::vector<torch::Tensor> gn_nhwc_backward(
     const torch::Tensor dy,
+    const torch::Tensor X,
     const torch::Tensor weight,
-    const torch::Tensor bias,
     const torch::Tensor means,
     const torch::Tensor rstds,
     const int G) {
   CHECK_CUDA(dy);
+  CHECK_CUDA(X);
   CHECK_CUDA(weight);
-  CHECK_CUDA(bias);
   CHECK_CUDA(means);
   CHECK_CUDA(rstds);
-  return gn_nhwc_cuda_backward(dy, weight, bias, means, rstds, G);
+  return gn_nhwc_cuda_backward(dy, X, weight, means, rstds, G);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &gn_nhwc_forward, "GN NHWC backward");
-  m.def("foward", &gn_nhwc_backward, "GN NHWC backward");
+  m.def("backward", &gn_nhwc_backward, "GN NHWC backward");
 }
