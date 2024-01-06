@@ -22,12 +22,8 @@ python -u main.py \
 --postfix $conf_name'_gpus'$gpu_n \
 --num-nodes $node_n \
 --random-seed True \
-<<<<<<< Updated upstream
---debug False
-=======
 --no-test True \
 --debug False \
 #--enable-profiler False
->>>>>>> Stashed changes
 
 #--root-path '/scratch/tnguy231/RFExperiments/tnguy231' --base 'configs/ROHQD.yaml' -t True --postfix ROHQD_gpus1 --num-nodes 1 --random-seed True --debug True

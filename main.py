@@ -10,11 +10,6 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks.progress.tqdm_progress import TQDMProgressBar, Tqdm
 from pytorch_lightning.callbacks import ModelCheckpoint, Callback, LearningRateMonitor
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
-<<<<<<< Updated upstream
-from copy import deepcopy
-import random, wandb
-torch.set_float32_matmul_precision('high')
-=======
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning import seed_everything
 from copy import deepcopy
@@ -22,7 +17,6 @@ import random, wandb
 torch.set_float32_matmul_precision('high')
 torch._dynamo.config.cache_size_limit = 256
 torch.backends.cudnn.benchmark = True
->>>>>>> Stashed changes
 
 def get_obj_from_str(string, reload=False):
     module, cls = string.rsplit(".", 1)
@@ -208,12 +202,6 @@ class DataModuleFromConfig(pl.LightningDataModule):
         if self.wrap:
             for k in self.datasets:
                 self.datasets[k] = WrappedDataset(self.datasets[k])
-<<<<<<< Updated upstream
-
-    def _train_dataloader(self):
-        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, shuffle=True, persistent_workers=True, pin_memory=True)
-=======
     
     def train_dataloader(self):
         if hasattr(self, '_train_dataloader'):
@@ -221,7 +209,6 @@ class DataModuleFromConfig(pl.LightningDataModule):
         self._train_dataloader = DataLoader(self.datasets["train"], batch_size=self.batch_size,
                                             num_workers=self.num_workers, shuffle=True, persistent_workers=True, pin_memory=True)
         return self._train_dataloader
->>>>>>> Stashed changes
 
     def _val_dataloader(self):
         return DataLoader(self.datasets["validation"],
@@ -281,11 +268,7 @@ class ImageLogger(Callback):
     def _wandb(self, pl_module, images, batch_idx, split):
         grids = dict()
         for k in images:
-<<<<<<< Updated upstream
-            grid = torchvision.utils.make_grid(images[k])
-=======
             grid = torchvision.utils.make_grid(images[k], nrow=4)
->>>>>>> Stashed changes
             grids[f"{split}/{k}"] = wandb.Image(grid, )
         pl_module.logger.experiment.log(grids)
 
@@ -355,8 +338,6 @@ class ImageLogger(Callback):
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
         self.log_img(pl_module, batch, batch_idx, split="val")
 
-<<<<<<< Updated upstream
-=======
 class ProgressBar(TQDMProgressBar):
     def init_train_tqdm(self):
         """Override this to customize the tqdm bar for training."""
@@ -371,7 +352,6 @@ class ProgressBar(TQDMProgressBar):
             bar_format=self.BAR_FORMAT,
         )
 
->>>>>>> Stashed changes
 if __name__ == "__main__":
     # custom parser to specify config files, train, test and debug mode,
     # postfix, resume.
@@ -482,19 +462,11 @@ if __name__ == "__main__":
         
         for k in nondefault_trainer_args(opt):
             trainer_config[k] = getattr(opt, k)
-<<<<<<< Updated upstream
-        if not "devices" in trainer_config:
-            #del trainer_config["distributed_backend"]
-            cpu = True
-        else:
-            gpuinfo = trainer_config["devices"]
-=======
         if not "devices" in trainer_config and os.environ['CUDA_VISIBLE_DEVICES'] == '':
             #del trainer_config["distributed_backend"]
             cpu = True
         else:
             gpuinfo = trainer_config["devices"] if 'devices' in trainer_config else os.environ['CUDA_VISIBLE_DEVICES']
->>>>>>> Stashed changes
             print(f"Running on GPUs {gpuinfo}")
             cpu = False
         lightning_config.trainer = trainer_config
@@ -515,10 +487,6 @@ if __name__ == "__main__":
                     "save_dir": logdir,
                     "offline": opt.debug,
                     "id": nowname,
-<<<<<<< Updated upstream
-                    "config": OmegaConf.to_container(whole_config),
-=======
->>>>>>> Stashed changes
                 }
             },
         }
@@ -545,11 +513,8 @@ if __name__ == "__main__":
                 "filename": "{epoch:06}",
                 "verbose": True,
                 "save_last": True,
-<<<<<<< Updated upstream
-=======
                 "monitor": "train/rec_loss_epoch",
                 "save_top_k": 1,
->>>>>>> Stashed changes
                 "every_n_epochs": 1
             }
         }
@@ -563,23 +528,10 @@ if __name__ == "__main__":
         except:
             modelckpt_cfg = OmegaConf.create()
         modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
-<<<<<<< Updated upstream
-        #trainer_kwargs["checkpoint_callback"] = instantiate_from_config(modelckpt_cfg)
-=======
->>>>>>> Stashed changes
         trainer_kwargs["callbacks"] = [instantiate_from_config(modelckpt_cfg)]
         trainer_kwargs["strategy"] = 'ddp_find_unused_parameters_true'
         trainer_kwargs["default_root_dir"] = logdir
 
-<<<<<<< Updated upstream
-        try:
-            profiler_config = OmegaConf.to_container(lightning_config.get('profiler', OmegaConf.create()))
-            if 'params' in profiler_config and 'schedule' in profiler_config['params']:
-                profiler_config['params']['schedule'] = instantiate_from_config(profiler_config['params']['schedule'])
-            trainer_kwargs["profiler"] = instantiate_from_config(profiler_config)
-        except:
-            pass
-=======
         if opt.enable_profiler:
             assert opt.debug, "Error: Debug mode must be on for profiler to be enabled."
             try:
@@ -594,7 +546,6 @@ if __name__ == "__main__":
                 print(trainer_kwargs["profiler"])
             except Exception as e:
                 print('Exception when creating profiler:', e)
->>>>>>> Stashed changes
 
         # add callback which sets up log directory
         default_callbacks_cfg = {
@@ -650,15 +601,11 @@ if __name__ == "__main__":
         # configure learning rate
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
         if not cpu:
-<<<<<<< Updated upstream
-            ngpu = len(lightning_config.trainer.devices.strip(",").split(','))
-=======
             dev_str = os.environ['CUDA_VISIBLE_DEVICES']
             if hasattr(lightning_config.trainer, 'devices') and isinstance(lightning_config.trainer.devices, str):
                 dev_str = lightning_config.trainer.devices
             print('devices:', dev_str)
             ngpu = len(dev_str.strip(",").split(','))
->>>>>>> Stashed changes
         else:
             ngpu = 1
 
@@ -691,11 +638,6 @@ if __name__ == "__main__":
         # run
         if opt.train:
             try:
-<<<<<<< Updated upstream
-                #compiled_model = torch.compile(model)
-                #trainer.fit(compiled_model, data)
-=======
->>>>>>> Stashed changes
                 try:
                     resume_ckpt = config.model.params.ckpt_path
                 except:
