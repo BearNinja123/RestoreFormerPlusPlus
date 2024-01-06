@@ -43,16 +43,19 @@ compute_stats(
         T* rstds
   ) {
   using T_ACC = at::acc_type<T, true>;
-  using WelfordType = at::native::WelfordData<T_ACC, int64_t>;
-  using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int64_t, thrust::pair<T_ACC, T_ACC>>;
+  //using WelfordType = at::native::WelfordData<T_ACC, int64_t>;
+  //using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int64_t, thrust::pair<T_ACC, T_ACC>>;
+  using WelfordType = at::native::WelfordData<T_ACC, int>;
+  using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
 
   WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
   WelfordType val(0, 0, 0, 0);
 
   const int g = blockDim.y;
   for (int i = 0; i < HWd; ++i) {
-    T x = X[blockIdx.x * HWd * G + i * g * G + threadIdx.y * G + threadIdx.x];
-    val = welford_op.reduce(val, static_cast<T_ACC>(x), i); // check last arg, probably wrong
+    const int reduce_idx = i * g * G + threadIdx.y * G + threadIdx.x;
+    T x = X[blockIdx.x * HWd * G + reduce_idx];
+    val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // check last arg, probably wrong
   }
 
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[THREADS_PER_BLOCK];
@@ -87,12 +90,12 @@ void gn_nhwc_forward_kernel(
   const int C = X.size(3);
   const int D = C / G;
   const int g = THREADS_PER_BLOCK / G;
-  const int d = D / g;
+  const int HWd = H * W * D / g;
 
   const dim3 dimGrid(N);
   const dim3 dimBlock(G, g);
   compute_stats<T><<<dimGrid, dimBlock>>>(
-      X_data, G, H * W * d, eps,
+      X_data, G, HWd, eps,
       mean_data, rstd_data
   );
 
@@ -144,17 +147,18 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward(
   return {X_out.permute({0, 3, 1, 2}), means, rstds};
 }
 
-// Reduces a value across the y-threads of a threadblock
+// let output_buffer be size THREADS_PER_BLOCK and can be reshaped to (THREADS_PER_BLOCK/num_elems, num_elems); output will be sum(output_buffer, dim=0)
 template <typename T>
 __device__ void
-y_sum_reduce(
+sum_reduce(
     T val,
-    T* output_buffer
+    T* output_buffer,
+    const int num_elems
     ) {
   int tid = threadIdx.y * blockDim.x + threadIdx.x;
   output_buffer[tid] = val;
   __syncthreads();
-  for (int stride = (int)(blockDim.x * blockDim.y / 2); stride >= (int)blockDim.x; stride >>= 1) {
+  for (int stride = (int)(blockDim.x * blockDim.y / 2); stride >= num_elems; stride >>= 1) {
     if (tid < stride)
       output_buffer[tid] = output_buffer[tid] + output_buffer[tid + stride];
     __syncthreads();
@@ -165,37 +169,39 @@ y_sum_reduce(
 template <typename T>
 __global__ void
 compute_backward_params(
-        const T* dy,
-        const T* X,
-        const T* means,
-        const T* rstds,
-        const T* weight,
-        const int HWD,
+        const T* dy,    // N x HWD x G
+        const T* X,     // N x HWD x G
+        const T* means, // N x G
+        const T* rstds, // N x G
+        const T* weight, // C (DG) (C)
+        const int HW,
+        const int C,
         const int G,
         at::acc_type<T, true>* coef2,
         at::acc_type<T, true>* coef3) {
   using T_ACC = at::acc_type<T, true>;
   T_ACC sum1 = 0;
   T_ACC sum2 = 0;
-  const int g = THREADS_PER_BLOCK / G;
-  const int HWd = HWD / g;
-  const int ng = blockIdx.x * G + threadIdx.x; // [bix][tx]
+  const int HWD = HW * C / G;
+  const int HWd = HW * C / THREADS_PER_BLOCK;
+  const int nc = blockIdx.x * G + threadIdx.x; // [bix][tx]
+  const int ng = blockIdx.x * G + (threadIdx.x % G);
 
   for (int i = 0; i < HWd; ++i) {
-    int index = blockIdx.x * HWD*G + i * g*G + threadIdx.y * G + threadIdx.x; // [bix][i][ty][tx]
-    T_ACC gamma_v = static_cast<T_ACC>(weight[ng]);
+    int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
+    T_ACC gamma_v = static_cast<T_ACC>(weight[nc]);
     sum1 += static_cast<T_ACC>(dy[index]) * static_cast<T_ACC>(X[index]) * gamma_v; // sum1 = sum(X * gamma * dy)
     sum2 += static_cast<T_ACC>(dy[index]) * gamma_v; // sum1 = sum(X * gamma * dy)
   }
 
   __shared__ T_ACC reduced_sum1[THREADS_PER_BLOCK];
   __shared__ T_ACC reduced_sum2[THREADS_PER_BLOCK];
-  y_sum_reduce(sum1, reduced_sum1);
-  y_sum_reduce(sum2, reduced_sum2);
+  sum_reduce(sum1, reduced_sum1, G);
+  sum_reduce(sum2, reduced_sum2, G);
 
-  if (threadIdx.y == 0) {
-    T_ACC sum1 = reduced_sum1[threadIdx.x];
-    T_ACC sum2 = reduced_sum2[threadIdx.x];
+  if (threadIdx.y == 0 && (int)threadIdx.x < G) {
+    sum1 = reduced_sum1[threadIdx.x];
+    sum2 = reduced_sum2[threadIdx.x];
 
     T_ACC mean = static_cast<T_ACC>(means[ng]);
     T_ACC rstd = static_cast<T_ACC>(rstds[ng]);
@@ -228,9 +234,7 @@ backward_weight_bias(
   const int ng = blockIdx.x * G + threadIdx.x % G; // [bix][i][ty][tx]
 
   for (int i = 0; i < Hw; ++i) {
-  //for (int i = 0; i < 1; ++i) {
     int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
-    //int index = threadIdx.x; // [bix][i][ty][tx]
     T_ACC dy_elem = static_cast<T_ACC>(dy[index]);
     dweight_sum += dy_elem * (static_cast<T_ACC>(X[index]) - static_cast<T_ACC>(means[ng])) * static_cast<T_ACC>(rstds[ng]);
     dbias_sum += dy_elem;
@@ -238,14 +242,12 @@ backward_weight_bias(
 
   __shared__ T_ACC reduced_dweight[THREADS_PER_BLOCK];
   __shared__ T_ACC reduced_dbias[THREADS_PER_BLOCK];
-  y_sum_reduce(dweight_sum, reduced_dweight);
-  y_sum_reduce(dbias_sum, reduced_dbias);
+  sum_reduce(dweight_sum, reduced_dweight, blockDim.x);
+  sum_reduce(dbias_sum, reduced_dbias, blockDim.x);
 
   if (threadIdx.y == 0) {
     dweight[threadIdx.x] = reduced_dweight[threadIdx.x];
     dbias[threadIdx.x] = reduced_dbias[threadIdx.x];
-    //dweight[threadIdx.x] = dweight_sum;
-    //dbias[threadIdx.x] = dbias_sum;
   }
 }
 
@@ -283,9 +285,9 @@ void gn_nhwc_backward_kernel(
 
   const dim3 dimGrid(N);
   const dim3 dimBlock(G, g);
-  compute_backward_params<T><<<dimGrid, dimBlock>>>(
+  compute_backward_params<T><<<N, dim3(C, THREADS_PER_BLOCK / C)>>>(
       dy_data, X_data, mean_data, rstd_data, weight_data,
-      H * W * D, G,
+      H * W, C, G,
       coef2_data, coef3_data
   );
 

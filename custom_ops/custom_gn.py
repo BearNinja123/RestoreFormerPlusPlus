@@ -6,9 +6,9 @@ import time
 torch.set_printoptions(sci_mode=False)
 
 from torch.utils.cpp_extension import load
-gn_op = load(name="gn_op", sources=["custom_gn.cpp", "custom_gn_kernel.cu"], extra_cuda_cflags=['--extended-lambda'])
+gn_op = load(name="gn_op", sources=["custom_gn.cpp", "custom_gn_kernel.cu"], extra_cuda_cflags=['--extended-lambda', '-lineinfo'])
 
-class GN_NHWCNaiveNaive(nn.GroupNorm):
+class GN_NHWCRefRef(nn.GroupNorm):
     def __init__(self, num_groups: int, nc: int, **kwargs):
         super().__init__(num_groups, nc, **kwargs)
 
@@ -18,7 +18,7 @@ class GN_NHWCNaiveNaive(nn.GroupNorm):
         x_reshaped = x.contiguous().view(N, C//self.num_groups, self.num_groups, H, W).transpose(1, 2).reshape(N, C, H, W).contiguous()
         return super().forward(x_reshaped).view(N, self.num_groups, C//self.num_groups, H, W).transpose(1, 2).reshape(N, C, H, W).contiguous() # untranspose x
 
-class GN_NHWCNaive(nn.GroupNorm):
+class GN_NHWCRef(nn.GroupNorm):
     def __init__(self, num_groups: int, nc: int, **kwargs):
         super().__init__(num_groups, nc, **kwargs)
 
@@ -60,47 +60,55 @@ class GN_NHWC(nn.GroupNorm):
             return GN_NHWC_Func.apply(x, w, b, self.num_groups, self.eps)
 
 if __name__ == '__main__':
-    C = 1024
-    #x = torch.arange(C).reshape((1, C, 1, 1)).float().cuda().requires_grad_(True)
-    x_nchw = torch.randn((32, C, 64, 64)).to(memory_format=torch.channels_last).cuda().requires_grad_(True)
-    x_nhwc = x_nchw.to(memory_format=torch.channels_last).cuda().requires_grad_(True)
-    #x = torch.randn((32, C, 64, 64)).cuda().requires_grad_(True)
-    gn_nchw = nn.GroupNorm(C//2, C).cuda()
-    gn1 = GN_NHWCNaive(C//2, C).cuda()
-    gn2 = GN_NHWC(C//2, C).cuda()
-    #gn1 = GN_NHWCNaive(C, C).cuda()
-    #gn2 = GN_NHWC(C, C).cuda()
+    C = 256
+    ##x = torch.arange(C).reshape((1, C, 1, 1)).float().cuda().requires_grad_(True)
+    #x = torch.randn((1, C, 2, 2)).cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last)
+    #gn1 = GN_NHWCRef(4, C).cuda()
+    #gn2 = GN_NHWC(4, C).cuda()
+    #with torch.no_grad():
+    #    w = torch.randn((C,))
+    #    b = torch.randn((C,))
+    #    gn1.weight.copy_(w)
+    #    gn1.bias.copy_(b)
+    #    gn2.weight.copy_(w)
+    #    gn2.bias.copy_(b)
     #g1 = gn1(x)
     #print('FORWARD')
     #print('g1')
-    #print(g1.reshape((C,)))
+    #print(g1.reshape((g1.numel(),)))
     #g2 = gn2(x)
     #print('g2')
-    #print(g2.reshape((C,)))
+    #print(g2.reshape((g2.numel(),)))
     #print('BACKWARD')
     #print('g1 sum wrt x')
-    #print(torch.autograd.grad(g1.sum(), x, retain_graph=True)[0].reshape((C,)))
-    #print('g1 sum wrt w')
-    #print(torch.autograd.grad(g1.sum(), gn1.weight, retain_graph=True)[0].reshape((C,)))
-    #print('g1 sum wrt b')
-    #print(torch.autograd.grad(g1.sum(), gn1.bias, retain_graph=True)[0].reshape((C,)))
+    #print(torch.autograd.grad(g1.sum(), x, retain_graph=True)[0].reshape((x.numel(),)))
     #print('g2 sum wrt x')
-    #print(torch.autograd.grad(g2.sum(), x, retain_graph=True)[0].reshape((C,)))
+    #print(torch.autograd.grad(g2.sum(), x, retain_graph=True)[0].reshape((x.numel(),)))
+
+    #print('g1 sum wrt w')
+    #print(torch.autograd.grad(g1.sum(), gn1.weight, retain_graph=True)[0].reshape((gn1.weight.numel(),)))
     #print('g2 sum wrt w')
-    #print(torch.autograd.grad(g2.sum(), gn2.weight, retain_graph=True)[0].reshape((C,)))
+    #print(torch.autograd.grad(g2.sum(), gn2.weight, retain_graph=True)[0].reshape((gn2.weight.numel(),)))
+    #print('g1 sum wrt b')
+    #print(torch.autograd.grad(g1.sum(), gn1.bias, retain_graph=True)[0].reshape((gn1.bias.numel(),)))
     #print('g2 sum wrt b')
-    #print(torch.autograd.grad(g2.sum(), gn2.bias, retain_graph=True)[0].reshape((C,)))
-    ##print(torch.autograd.grad(g2.sum(), gn2.weight)[0].reshape((C,)))
-    ##print((g1 - g2).abs().mean())
+    #print(torch.autograd.grad(g2.sum(), gn2.bias, retain_graph=True)[0].reshape((gn2.bias.numel(),)))
 
-    for i in tqdm(range(100), smoothing=1):
-        #g1 = gn1(x_nhwc)
-        #torch.autograd.grad(g1.sum(), x_nhwc)
-        g1 = gn_nchw(x_nchw)
-        torch.autograd.grad(g1.sum(), x_nchw)
-        torch.cuda.synchronize()
-
-    for i in tqdm(range(100), smoothing=1):
-        g2 = gn2(x_nhwc)
-        torch.autograd.grad(g2.sum(), x_nhwc)
-        torch.cuda.synchronize()
+    x_nchw = torch.randn((32, C, 128, 128)).cuda().requires_grad_(True)
+    x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
+    #gn_nchw = nn.GroupNorm(*gn_args).cuda()
+    #gn1 = GN_NHWCRef(*gn_args).cuda()
+    #gn2 = GN_NHWC(*gn_args).cuda()
+    gn_args = (8, C)
+    for gn_class, gn_input, desc in (
+            (GN_NHWC, x_nhwc, 'GN NHWC (custom op)'),
+            #(nn.GroupNorm, x_nchw, 'nn GN NCHW'),
+            #(nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
+            #(GN_NHWCRef, x_nhwc, 'GN NHWC (reference)'),
+            ):
+        print(desc)
+        gn_layer = gn_class(*gn_args).cuda()
+        for i in tqdm(range(1), smoothing=1):
+            g = gn_layer(gn_input)
+            #torch.autograd.grad(g.sum(), gn_input)
+            torch.cuda.synchronize()
