@@ -2,7 +2,6 @@ import functools
 import torch.nn as nn
 import torch
 
-from basicsr.ops.fused_act import FusedLeakyReLU
 from RestoreFormer.modules.util import ActNorm
 
 
@@ -14,14 +13,13 @@ def weights_init(m):
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0)
 
-class Normalize(nn.Module): # runs GroupNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
+class Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
     def __init__(self, in_channels: int, num_groups: int = 32):
-        super().__init__()
-        self.norm = nn.GroupNorm(num_groups, in_channels, eps=1e-6, affine=True)
+        super().__init__(in_channels)
     
     def forward(self, x):
         with torch.autocast('cuda', enabled=False):
-            return self.norm(x)
+            return super().forward(x)
 
 class NLayerDiscriminator(nn.Module):
     """Defines a PatchGAN discriminator as in Pix2Pix

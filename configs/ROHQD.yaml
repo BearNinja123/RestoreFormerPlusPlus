@@ -3,23 +3,27 @@ model:
   target: RestoreFormer.models.vqgan_v1.RestoreFormerModel
   params:
     image_key: 'gt'
+<<<<<<< Updated upstream
     ckpt_path: /scratch/tnguy231/RFExperiments/tnguy231/logs/debug_runs/2023-12-14T19-22-06_ROHQDROHQD_gpus1_seed64/checkpoints/last.ckpt # YOUR MODEL PATH GOES HERE
+=======
+    #ckpt_path: /scratch/tnguy231/RFExperiments/tnguy231/logs/2023-12-20T17-34-11_ROHQDROHQD_gpus1_seed76/checkpoints/epoch=000067.ckpt
+>>>>>>> Stashed changes
     schedule_step: [100000, 200000]
     # ignore_keys: ['vqvae.quantize.utility_counter']
     ddconfig:
       target: RestoreFormer.modules.vqvae.vqvae_arch.VQVAEGAN
       params:
-        embed_dim: 256
-        n_embed: 1024
+        embed_dim: 512
+        n_embed: 4096
         double_z: False
-        z_channels: 256
+        z_channels: 512
         resolution: 512
         in_channels: 3
         out_ch: 3
         ch: 64
-        ch_mult: [ 1,2,2,4,4,8]  # num_down = len(ch_mult)-1
+        ch_mult: [1,2,2,4,4,8]  # num_down = len(ch_mult)-1
         num_res_blocks: 2
-        attn_resolutions: [16]
+        attn_resolutions: [16, 32, 64, 128]
         dropout: 0.0
         enable_mid: True
         fix_decoder: False
@@ -32,19 +36,33 @@ model:
         disc_conditional: False
         disc_in_channels: 3
         disc_start: 10001
+<<<<<<< Updated upstream
         disc_weight: 0.8
+=======
+        disc_weight: 1.0
+>>>>>>> Stashed changes
         codebook_weight: 1.0
+        identity_weight: 1.5
         use_actnorm: False
 
 data:
   target: main.DataModuleFromConfig
   params:
+<<<<<<< Updated upstream
     batch_size: 16 # per device (i.e. 16 images per gpu per batch)
     num_workers: 15
     train:
       target: RestoreFormer.data.ffhq_dataset_aug.FFHQAugDataset
       params:
         dataroot_gt: /scratch/tnguy231/FFHQ/image512x512 # YOUR IMAGE DATASET PATH GOES HERE
+=======
+    batch_size: 12 # per device
+    num_workers: 3
+    train:
+      target: RestoreFormer.data.ffhq_dataset_aug.FFHQAugDataset
+      params:
+        dataroot_gt: /scratch/tnguy231/FFHQ/image512x512
+>>>>>>> Stashed changes
         io_backend:
           type: disk
         use_hflip: True
@@ -78,6 +96,7 @@ data:
 
 lightning:
   trainer:
+<<<<<<< Updated upstream
     devices: "0,1,2,3"
     accelerator: cuda
     accumulate_grad_batches: 1
@@ -99,3 +118,33 @@ lightning:
   #        warmup: 1
   #        active: 3
   #        repeat: 1
+=======
+    #devices: "0," # commenting this out defaults to using all GPUs from CUDA_VISIBLE_DEVICES
+    accelerator: cuda
+    precision: bf16-true
+    accumulate_grad_batches: 1
+    #max_steps: 256
+
+  profiler: 
+    #target: pytorch_lightning.profilers.AdvancedProfiler
+    #params:
+    #  dirpath: "."
+    #  filename: "cprofout"
+
+    target: pytorch_lightning.profilers.PyTorchProfiler
+    params:
+      dirpath: perf_logs
+      filename: log
+      #emit_nvtx: True
+      export_to_chrome: True
+      # profiler kwargs
+      profile_memory: True
+      with_flops: True
+      schedule:
+        target: torch.profiler.schedule
+        params:
+          wait: 10
+          warmup: 1
+          active: 3
+          repeat: 1
+>>>>>>> Stashed changes

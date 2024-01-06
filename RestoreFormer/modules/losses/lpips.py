@@ -45,7 +45,7 @@ class LPIPS(nn.Module):
         outs0, outs1 = self.net(in0_input), self.net(in1_input)
         feats0, feats1, diffs = {}, {}, {}
         lins = [self.lin0, self.lin1, self.lin2, self.lin3, self.lin4]
-        style_loss = torch.tensor([0.0]).to(input.device)
+        style_loss = torch.tensor([0.0], device=input.device)
         for kk in range(len(self.chns)):
             feats0[kk], feats1[kk] = normalize_tensor(outs0[kk]), normalize_tensor(outs1[kk])
             diffs[kk] = (feats0[kk] - feats1[kk]) ** 2
@@ -99,7 +99,7 @@ class vgg16(torch.nn.Module):
     def __init__(self, requires_grad=False, pretrained=True):
         super(vgg16, self).__init__()
         vgg_weights = models.VGG16_Weights.DEFAULT if pretrained else None
-        vgg_pretrained_features = models.vgg16(weights=vgg_weights).features[:30]
+        vgg_pretrained_features = models.vgg16(weights=vgg_weights).features
         self.slice1 = torch.nn.Sequential()
         self.slice2 = torch.nn.Sequential()
         self.slice3 = torch.nn.Sequential()

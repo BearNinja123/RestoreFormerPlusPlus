@@ -50,18 +50,18 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         assert disc_loss in ["hinge", "vanilla"]
         self.codebook_weight = codebook_weight
         self.pixel_weight = pixelloss_weight
-        self.perceptual_loss = LPIPS(style_weight=lpips_style_weight).to(memory_format=torch.contiguous_format).eval()
+        self.perceptual_loss = LPIPS(style_weight=lpips_style_weight).to(memory_format=torch.channels_last).eval()
         self.perceptual_weight = perceptual_weight
 
         self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels,
                                                  n_layers=disc_num_layers,
                                                  use_actnorm=use_actnorm,
                                                  ndf=disc_ndf
-                                                 ).apply(weights_init).to(memory_format=torch.contiguous_format)
+                                                 ).apply(weights_init).to(memory_format=torch.channels_last)
         if comp_weight > 0:
-            self.net_d_left_eye = FacialComponentDiscriminator().to(memory_format=torch.contiguous_format)
-            self.net_d_right_eye = FacialComponentDiscriminator().to(memory_format=torch.contiguous_format)
-            self.net_d_mouth = FacialComponentDiscriminator().to(memory_format=torch.contiguous_format)
+            self.net_d_left_eye = FacialComponentDiscriminator().to(memory_format=torch.channels_last)
+            self.net_d_right_eye = FacialComponentDiscriminator().to(memory_format=torch.channels_last)
+            self.net_d_mouth = FacialComponentDiscriminator().to(memory_format=torch.channels_last)
             print(f'Use components discrimination')
 
             self.cri_component = GANLoss(gan_type=comp_disc_loss, 
@@ -75,7 +75,7 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         if identity_weight > 0:
             self.identity = ResNetArcFace(block = 'IRBlock', 
                                           layers = [2, 2, 2, 2],
-                                          use_se = False).to(memory_format=torch.contiguous_format)
+                                          use_se = False).to(memory_format=torch.channels_last)
             print(f'Use identity loss')
             if identity_model_path is not None:
                 sd = torch.load(identity_model_path, map_location="cpu")
@@ -114,8 +114,7 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         g_grads = torch.autograd.grad(g_loss, last_layer.weight, retain_graph=True)[0]
 
         d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
-        d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
-        d_weight = d_weight * self.discriminator_weight
+        d_weight = torch.clamp(d_weight, 0.0, 1e4).detach() * self.discriminator_weight
         return d_weight
 
     def _gram_mat(self, x):
@@ -142,36 +141,31 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
     def forward(self, codebook_loss, gts, reconstructions, components,
                 global_step, last_layer=None, penult=None, split="train"):
         # now the GAN part
-        rec_loss = (torch.abs(gts.contiguous(memory_format=torch.contiguous_format) - reconstructions.contiguous(memory_format=torch.contiguous_format))) * self.pixel_weight
-        if self.perceptual_weight > 0:
-            p_loss, p_style_loss = self.perceptual_loss(gts.contiguous(memory_format=torch.contiguous_format), reconstructions.contiguous(memory_format=torch.contiguous_format))
-            rec_loss = rec_loss + self.perceptual_weight * p_loss
-        else:
-            p_loss = torch.tensor([0.0])
-            p_style_loss = torch.tensor([0.0])
+        @torch.compile
+        def _p_loss_fn():
+            rec_loss = (torch.abs(gts - reconstructions)) * self.pixel_weight
+            if self.perceptual_weight > 0:
+                p_loss, p_style_loss = self.perceptual_loss(gts, reconstructions)
+                rec_loss = rec_loss + self.perceptual_weight * p_loss
+            else:
+                p_loss = torch.tensor([0.0])
+                p_style_loss = torch.tensor([0.0])
 
-        nll_loss = rec_loss
-        nll_loss = torch.mean(nll_loss)
+            nll_loss = rec_loss
+            nll_loss = torch.mean(nll_loss)
+
+            return rec_loss, nll_loss, p_loss, p_style_loss
+
+        rec_loss, nll_loss, p_loss, p_style_loss = _p_loss_fn()
     
         # generator update
-        logits_fake = self.discriminator(reconstructions.contiguous(memory_format=torch.contiguous_format))
+        logits_fake = self.discriminator(reconstructions)
         g_loss = -torch.mean(logits_fake)
 
         try:
-            if penult is None:
-                d_weight = self.calculate_adaptive_weight(nll_loss, g_loss, last_layer=last_layer)
-            else:
-                nll_grads = torch.autograd.grad(nll_loss, last_layer.weight, retain_graph=True)[0]
-
-                reconstructions_adv = last_layer(penult.detach())
-                logits_fake_tmp = self.discriminator(reconstructions_adv.contiguous(memory_format=torch.contiguous_format))
-                g_loss_tmp = -torch.mean(logits_fake_tmp)
-                g_grads = torch.autograd.grad(g_loss_tmp, last_layer.weight, retain_graph=False)[0]
-
-                d_weight = torch.norm(nll_grads) / (torch.norm(g_grads) + 1e-4)
-                d_weight = torch.clamp(d_weight, 0.0, 1e4).detach()
-                d_weight *= self.discriminator_weight
-        except RuntimeError:
+            d_weight = self.calculate_adaptive_weight(nll_loss, g_loss, last_layer=last_layer)
+        except RuntimeError as e:
+            print(e)
             assert not self.training
             d_weight = torch.tensor(0.0)
 
@@ -227,6 +221,7 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
             })
 
             if self.comp_style_weight > 0.:
+                @torch.compile
                 def _comp_style(feat, feat_gt, criterion):
                     return criterion(self._gram_mat(feat[0]), self._gram_mat(
                         feat_gt[0].detach())) * 0.5 + criterion(self._gram_mat(
@@ -244,22 +239,27 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
                 log["{}/comp_style_loss".format(split)] = comp_style_loss.detach()
 
         if self.identity_weight > 0. and self.discriminator_iter_start < global_step:
-            self.identity.eval()
-            out_gray = self.gray_resize_for_identity(reconstructions)
-            gt_gray = self.gray_resize_for_identity(gts)
-            
-            identity_gt = self.identity(gt_gray).detach()
-            identity_out = self.identity(out_gray)
+            @torch.compile
+            def _identity_loss():
+                self.identity.eval()
+                out_gray = self.gray_resize_for_identity(reconstructions)
+                gt_gray = self.gray_resize_for_identity(gts)
+                
+                identity_gt = self.identity(gt_gray).detach()
+                identity_out = self.identity(out_gray)
 
-            identity_loss = self.cri_identity(identity_out, identity_gt)
+                identity_loss = self.cri_identity(identity_out, identity_gt)
+                return identity_loss
+
+            identity_loss = _identity_loss()
             loss = loss + identity_loss 
             log["{}/identity_loss".format(split)] = identity_loss.detach()
 
         log["{}/total_loss".format(split)] = loss.clone().detach().mean()
 
         # second pass for discriminator update
-        logits_fake = self.discriminator(reconstructions.contiguous(memory_format=torch.contiguous_format).detach())
-        logits_real = self.discriminator(gts.contiguous(memory_format=torch.contiguous_format).detach())
+        logits_fake = self.discriminator(reconstructions.detach())
+        logits_real = self.discriminator(gts.detach())
         disc_factor = adopt_weight(self.disc_factor, global_step, threshold=self.discriminator_iter_start)
         d_loss = disc_factor * self.disc_loss(logits_real, logits_fake)
 

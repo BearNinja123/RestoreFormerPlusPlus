@@ -127,8 +127,8 @@ class SEBlock(nn.Module):
 
     def forward(self, x):
         b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
+        y = self.avg_pool(x).reshape(b, c)
+        y = self.fc(y).reshape(b, c, 1, 1)
         return x * y
 
 
@@ -191,7 +191,7 @@ class ResNetArcFace(nn.Module):
         x = self.layer4(x)
         x = self.bn4(x)
         x = self.dropout(x)
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
         x = self.fc5(x)
         x = self.bn5(x)
 

@@ -10,6 +10,8 @@ from RestoreFormer.modules.vqvae.utils import get_roi_regions
 def count_params(module):
     return sum(p.numel() for p in module.parameters())
 
+MEM_FMT = torch.contiguous_format
+
 class RestoreFormerModel(pl.LightningModule):
     def __init__(self,
                  ddconfig,
@@ -27,12 +29,12 @@ class RestoreFormerModel(pl.LightningModule):
         self.automatic_optimization = False
         self.save_hyperparameters()
         self.image_key = image_key
-        self.vqvae = instantiate_from_config(ddconfig).to(memory_format=torch.contiguous_format)
+        self.vqvae = instantiate_from_config(ddconfig).to(memory_format=MEM_FMT)
+
         lossconfig['params']['distill_param'] = ddconfig['params']
-        self.loss = instantiate_from_config(lossconfig)
+        self.loss = instantiate_from_config(lossconfig).to(memory_format=MEM_FMT)
         self.loss.max_discriminator_weight = count_params(self.loss.discriminator) / count_params(self.vqvae)
         print("Loss max discriminator weight:", self.loss.max_discriminator_weight)
-        self.loss = torch.compile(self.loss)
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
         
@@ -166,7 +168,8 @@ class RestoreFormerModel(pl.LightningModule):
                 normal_params.append(param)
         opt_ae_params = [{'params': normal_params, 'lr': lr},
                          {'params': special_params, 'lr': lr*self.special_params_lr_scale}]
-        opt_ae = torch.optim.Adam(opt_ae_params, betas=(0.5, 0.9), fused=True)
+        #opt_ae = torch.optim.Adam(opt_ae_params, betas=(0.5, 0.9), fused=True)
+        opt_ae = torch.optim.Adam(self.vqvae.parameters(), betas=(0.5, 0.9), fused=True)
         opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
                                     lr=lr, betas=(0.5, 0.9), fused=True)
 
@@ -199,9 +202,11 @@ class RestoreFormerModel(pl.LightningModule):
 
     @torch.no_grad
     def log_images(self, batch, **kwargs):
+        self.vqvae.eval()
         log = dict()
         x = (batch[self.image_key].to(self.device) - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
         xrec, _qloss, _info, _hs, _penult = self(x)
+        self.vqvae.train()
         log["inputs"] = x
         log["reconstructions"] = xrec
 
@@ -211,7 +216,8 @@ class RestoreFormerModel(pl.LightningModule):
         return log
 
     def transfer_batch_to_device(self, batch, device, dataloader_idx):
-        for k, v in batch.items():
-            if isinstance(v, torch.Tensor) and v.ndim == 4:
-                batch[k] = v.to(memory_format=torch.contiguous_format)
+        if MEM_FMT != torch.contiguous_format:
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor) and v.ndim == 4:
+                    batch[k] = v.to(memory_format=MEM_FMT)
         return super().transfer_batch_to_device(batch, device, dataloader_idx)

@@ -1,4 +1,5 @@
-from basicsr.archs.stylegan2_arch import UpFirDnUpsample
+#from basicsr.archs.stylegan2_arch import UpFirDnUpsample
+from sfast.triton.torch_ops import group_norm_silu
 import numpy as np
 import torch
 import torch.nn as nn
@@ -74,15 +75,16 @@ class VectorQuantizer(nn.Module):
 
 nonlinearity = F.silu
 
-class Normalize(nn.Module): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
+#class Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
+class Normalize(nn.GroupNorm): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
     def __init__(self, in_channels: int, num_groups: int = 32):
-        super().__init__()
-        self.norm = nn.BatchNorm2d(in_channels, eps=1e-6, affine=True)
-        #self.norm = nn.GroupNorm(num_groups, in_channels, eps=1e-6, affine=True)
+        #super().__init__(in_channels)
+        super().__init__(num_groups, in_channels)
     
     def forward(self, x):
         with torch.autocast('cuda', enabled=False):
-            return self.norm(x)
+            return super().forward(x)
+            #return group_norm_silu(x, self.num_groups, self.weight, self.bias, self.eps)
 
 class Upsample(nn.Module):
     def __init__(self, in_channels, with_conv):
@@ -127,7 +129,6 @@ class ResnetBlock(nn.Module):
         self.conv1 = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
         self.norm2 = Normalize(out_channels)
-        self.dropout = torch.nn.Dropout(dropout)
         self.conv2 = torch.nn.Conv2d(out_channels, out_channels, 3, padding=1)
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
@@ -137,7 +138,7 @@ class ResnetBlock(nn.Module):
 
     def forward(self, x, temb):
         h = self.conv1(nonlinearity(self.norm1(x)))
-        h = self.conv2(self.dropout(nonlinearity(self.norm2(h))))
+        h = self.conv2(nonlinearity(self.norm2(h)))
         if self.in_channels != self.out_channels:
             x = self.conv_shortcut(x) if self.use_conv_shortcut else self.nin_shortcut(x)
         return x + h
@@ -317,17 +318,6 @@ class MultiHeadDecoder(nn.Module):
         self.conv_out = torch.nn.Conv2d(block_out, out_ch, 3, padding=1)
 
     def forward(self, z, hs=None, x_ref=None):
-        self.last_z_shape = z.shape
-
-        # timestep embedding
-        temb = None
-
-        # z to block_in
-        h = self.conv_in(z)
-
-        # middle
-        if self.enable_mid:
-            h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h, temb)), temb)
             if x_ref is not None:
                 h = self.mid.cross_attn(x_ref, h)
 
@@ -396,23 +386,29 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
         self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
 
         self.quant_conv = torch.nn.Conv2d(z_channels, embed_dim, 1)
+        self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, z_channels, 1)
 
-        if fix_decoder:
-            for _, param in self.decoder.named_parameters():
-                param.requires_grad = False
-            for _, param in self.post_quant_conv.named_parameters():
-                param.requires_grad = False
-            for _, param in self.quantize.named_parameters():
-                param.requires_grad = False
-        elif fix_codebook:
-            for _, param in self.quantize.named_parameters():
-                param.requires_grad = False
+        for i in range(ex_multi_scale_num):
+                attn_resolutions = [attn_resolutions[0], attn_resolutions[-1]*2]
+        self.decoder = MultiHeadDecoder(ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+                               attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
+                               resolution=resolution, z_channels=z_channels, enable_mid=enable_mid, head_size=head_size)
 
         if fix_encoder:
             for _, param in self.encoder.named_parameters():
                 param.requires_grad = False
             for _, param in self.quant_conv.named_parameters():
+                param.requires_grad = False
+        if fix_codebook:
+            for _, param in self.quantize.named_parameters():
+                param.requires_grad = False
+        elif fix_decoder:
+            for _, param in self.quantize.named_parameters():
+                param.requires_grad = False
+            for _, param in self.post_quant_conv.named_parameters():
+                param.requires_grad = False
+            for _, param in self.decoder.named_parameters():
                 param.requires_grad = False
 	    
 
