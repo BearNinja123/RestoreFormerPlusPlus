@@ -318,6 +318,17 @@ class MultiHeadDecoder(nn.Module):
         self.conv_out = torch.nn.Conv2d(block_out, out_ch, 3, padding=1)
 
     def forward(self, z, hs=None, x_ref=None):
+        self.last_z_shape = z.shape
+
+        # timestep embedding
+        temb = None
+
+        # z to block_in
+        h = self.conv_in(z)
+
+        # middle
+        if self.enable_mid:
+            h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h, temb)), temb)
             if x_ref is not None:
                 h = self.mid.cross_attn(x_ref, h)
 
