@@ -1,5 +1,5 @@
 #from basicsr.archs.stylegan2_arch import UpFirDnUpsample
-from sfast.triton.torch_ops import group_norm_silu
+#from sfast.triton.torch_ops import group_norm_silu
 import numpy as np
 import torch
 import torch.nn as nn
