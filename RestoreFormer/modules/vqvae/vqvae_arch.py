@@ -143,17 +143,19 @@ class ResnetBlock(nn.Module):
         return x + h
 
 class MultiHeadAttnBlock(nn.Module):
-    def __init__(self, in_channels, head_size=1):
+    def __init__(self, in_channels, head_size=1, y_channels=None):
         super().__init__()
         self.in_channels = in_channels
         self.head_size = head_size
         self.att_size = in_channels // head_size
         assert(in_channels % head_size == 0), 'The size of head should be divided by the number of channels.'
+        y_ch = in_channels if y_channels is None else y_channels
 
         self.norm1 = Normalize(in_channels)
-        self.norm2 = Normalize(in_channels)
+        if y_channels is not None:
+            self.norm2 = Normalize(y_ch)
 
-        self.q = torch.nn.Conv2d(in_channels, in_channels, 1)
+        self.q = torch.nn.Conv2d(y_ch, in_channels, 1) # kinda strange how the y (cross attention input) goes into the query but this is how RF++ does it
         self.k = torch.nn.Conv2d(in_channels, in_channels, 1)
         self.v = torch.nn.Conv2d(in_channels, in_channels, 1)
         self.proj_out = torch.nn.Conv2d(in_channels, in_channels, 1)
@@ -175,13 +177,14 @@ class MultiHeadAttnBlock(nn.Module):
 
         return x + self.proj_out(catted)
 
-class MultiHeadEncoder(nn.Module):
-    def __init__(self, ch, ch_mult=(1,2,4,8), num_res_blocks=2,
+class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference embedding
+    def __init__(self, ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
                  attn_resolutions=[16], dropout=0.0, resamp_with_conv=True, in_channels=3,
                  resolution=512, z_channels=256, double_z=True, enable_mid=True,
                  head_size=1, **ignore_kwargs):
         super().__init__()
         self.ch = ch
+        self.ref_ch = ref_ch
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
@@ -202,6 +205,8 @@ class MultiHeadEncoder(nn.Module):
             down = nn.Module()
             down.block = nn.ModuleList(block)
             down.attn = nn.ModuleList(attn)
+            if isinstance(ref_ch, int):
+                down.cross_attn = MultiHeadAttnBlock(block_out, head_size, y_channels=ref_ch)
             if layer_idx != self.num_resolutions - 1:
                 down.downsample = Downsample(block_out, resamp_with_conv)
                 curr_res = curr_res // 2
@@ -213,12 +218,14 @@ class MultiHeadEncoder(nn.Module):
             self.mid.block_1 = ResnetBlock(block_out, block_out, dropout=dropout)
             self.mid.attn_1 = MultiHeadAttnBlock(block_out, head_size)
             self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
+            if isinstance(ref_ch, int):
+                self.mid.cross_attn = MultiHeadAttnBlock(block_out, head_size, y_channels=ref_ch)
 
         # end
         self.norm_out = Normalize(block_out)
         self.conv_out = torch.nn.Conv2d(block_out, 2 * z_channels if double_z else z_channels, 3, padding=1)
 
-    def forward(self, x):
+    def forward(self, x, x_ref=None): # x_ref.shape = (N, ref_ch, H, W)
         hs = {}
         # timestep embedding
         temb = None
@@ -231,6 +238,8 @@ class MultiHeadEncoder(nn.Module):
                 h = self.down[i_level].block[i_block](h, temb)
                 if len(self.down[i_level].attn) > 0:
                     h = self.down[i_level].attn[i_block](h)
+                if x_ref is not None:
+                    h = self.down[i_level].cross_attn[i_block](x_ref, h) # x_ref is K/V, h is Q
 
             if i_level != self.num_resolutions-1:
                 hs['block_'+str(i_level)] = h
@@ -242,6 +251,8 @@ class MultiHeadEncoder(nn.Module):
             hs['block_'+str(i_level)+'_atten'] = h
             h = self.mid.attn_1(h)
             h = self.mid.block_2(h, temb)
+            if x_ref is not None:
+                h = self.mid.cross_attn(x_ref, h)
             hs['mid_atten'] = h
 
         # end
@@ -251,12 +262,13 @@ class MultiHeadEncoder(nn.Module):
         return hs
 
 class MultiHeadDecoder(nn.Module):
-    def __init__(self, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks=2,
+    def __init__(self, ch, out_ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
                  attn_resolutions=16, dropout=0.0, resamp_with_conv=True, in_channels=3,
                  resolution=512, z_channels=256, give_pre_end=False, enable_mid=True,
                  head_size=1, **ignorekwargs):
         super().__init__()
         self.ch = ch
+        self.ref_ch = ref_ch
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
@@ -280,6 +292,8 @@ class MultiHeadDecoder(nn.Module):
             self.mid.block_1 = ResnetBlock(block_out, block_out, dropout=dropout)
             self.mid.attn_1 = MultiHeadAttnBlock(block_out, head_size)
             self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
+            if isinstance(ref_ch, int):
+                self.mid.cross_attn = MultiHeadAttnBlock(block_out, head_size, y_channels=ref_ch)
 
         # upsampling
         self.up = nn.ModuleList()
@@ -291,6 +305,8 @@ class MultiHeadDecoder(nn.Module):
             up = nn.Module()
             up.block = nn.ModuleList(block)
             up.attn = nn.ModuleList(attn)
+            if isinstance(ref_ch, int):
+                up.cross_attn = MultiHeadAttnBlock(block_out, head_size, y_channels=ref_ch)
             if layer_idx != self.num_resolutions - 1:
                 up.upsample = Upsample(block_out, resamp_with_conv)
                 curr_res = curr_res * 2
@@ -300,7 +316,7 @@ class MultiHeadDecoder(nn.Module):
         self.norm_out = Normalize(block_out)
         self.conv_out = torch.nn.Conv2d(block_out, out_ch, 3, padding=1)
 
-    def forward(self, z, hs=None):
+    def forward(self, z, hs=None, x_ref=None):
         self.last_z_shape = z.shape
 
         # timestep embedding
@@ -312,6 +328,8 @@ class MultiHeadDecoder(nn.Module):
         # middle
         if self.enable_mid:
             h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h, temb)), temb)
+            if x_ref is not None:
+                h = self.mid.cross_attn(x_ref, h)
 
         # upsampling
         for rev_i_level, up_level in enumerate(reversed(self.up)):
@@ -325,6 +343,9 @@ class MultiHeadDecoder(nn.Module):
                         h = up_level.attn[i_block](h, hs['block_'+str(i_level)+'_atten'])
                     else:
                         h = up_level.attn[i_block](h, hs['block_'+str(i_level)])
+
+                    if x_ref is not None:
+                        h = up_level.cross_attn[i_block](x_ref, h)
             
             if i_level != 0:
                 h = up_level.upsample(h)
@@ -345,6 +366,7 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
                  embed_dim=256,
                  ch=64,
                  out_ch=3,
+                 ref_ch=None,
                  ch_mult=(1, 2, 2, 4, 4, 8),
                  num_res_blocks=2,
                  attn_resolutions=(16, ),
@@ -361,13 +383,13 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
                  ex_multi_scale_num=1):
         super(VQVAEGANMultiHeadTransformer, self).__init__()
 
-        self.encoder = MultiHeadEncoder(ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+        self.encoder = MultiHeadEncoder(ch=ch, out_ch=out_ch, ref_ch=ref_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
                                resolution=resolution, z_channels=z_channels, double_z=double_z, 
                                enable_mid=enable_mid, head_size=head_size)
         for i in range(ex_multi_scale_num):
                 attn_resolutions = [attn_resolutions[0], attn_resolutions[-1]*2]
-        self.decoder = MultiHeadDecoder(ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+        self.decoder = MultiHeadDecoder(ch=ch, out_ch=out_ch, ref_ch=ref_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
                                resolution=resolution, z_channels=z_channels, enable_mid=enable_mid, head_size=head_size)
 
@@ -394,23 +416,20 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
                 param.requires_grad = False
 	    
 
-    def encode(self, x):
-        hs = self.encoder(x)
+    def encode(self, x, x_ref=None):
+        hs = self.encoder(x, x_ref=x_ref)
         h = self.quant_conv(hs['out'])
         quant, emb_loss, info = self.quantize(h)
         return quant, emb_loss, info, hs
 
-    def decode(self, quant, hs=None):
+    def decode(self, quant, hs=None, x_ref=None):
         quant = self.post_quant_conv(quant)
-        dec, penult = self.decoder(quant, hs)
+        dec, penult = self.decoder(quant, hs, x_ref=x_ref)
         return dec, penult
 
-    def forward(self, input, ref=None):
-        quant, diff, info, hs = self.encode(input)
-        if ref is not None:
-            quant2, _diff, _info, _hs = self.encode(ref)
-            quant = quant2
-        dec, penult = self.decode(quant, hs)
+    def forward(self, input, x_ref=None):
+        quant, diff, info, hs = self.encode(input, x_ref=x_ref)
+        dec, penult = self.decode(quant, hs, x_ref=x_ref)
 
         return dec, diff, info, hs, penult
 
@@ -421,6 +440,7 @@ class VQVAEGAN(VQVAEGANMultiHeadTransformer): # VQVAEGANMultiHeadTransformer but
                  embed_dim=256,
                  ch=64,
                  out_ch=3,
+                 ref_ch=None,
                  ch_mult=(1, 2, 2, 4, 4, 8),
                  num_res_blocks=2,
                  attn_resolutions=(16, ),
@@ -435,18 +455,18 @@ class VQVAEGAN(VQVAEGANMultiHeadTransformer): # VQVAEGANMultiHeadTransformer but
                  head_size=4,
                  **ignore_kwargs):
         super(VQVAEGAN, self).__init__(
-            n_embed, embed_dim, ch, out_ch, ch_mult, num_res_blocks,
+            n_embed, embed_dim, ch, out_ch, ref_ch, ch_mult, num_res_blocks,
             attn_resolutions, dropout, in_channels, resolution,
             z_channels, double_z, enable_mid, fix_decoder, fix_codebook,
             False, head_size, 0
             )
 
-    def decode(self, quant):
+    def decode(self, quant, x_ref=None):
         quant = self.post_quant_conv(quant)
-        dec, penult = self.decoder(quant)
+        dec, penult = self.decoder(quant, x_ref=x_ref)
         return dec, penult
 
-    def forward(self, input):
-        quant, diff, info, hs = self.encode(input)
-        dec, penult = self.decode(quant)
+    def forward(self, input, x_ref=None):
+        quant, diff, info, hs = self.encode(input, x_ref=x_ref)
+        dec, penult = self.decode(quant, x_ref=x_ref)
         return dec, diff, info, hs, penult
