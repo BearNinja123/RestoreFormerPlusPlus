@@ -5,8 +5,8 @@ export BASICSR_JIT=True
 # conf_name='RestoreFormer'
 
 # For RestoreFormer++
-conf_name='ROHQD'
-#conf_name='RestoreFormerPlusPlus'
+#conf_name='ROHQD'
+conf_name='RestoreFormerPlusPlus'
 
 root_path='/scratch/tnguy231/RFExperiments/tnguy231'
 
@@ -23,7 +23,7 @@ python -u main.py \
 --num-nodes $node_n \
 --random-seed True \
 --no-test True \
---debug False \
+--debug True \
 #--enable-profiler False
 
 #--root-path '/scratch/tnguy231/RFExperiments/tnguy231' --base 'configs/ROHQD.yaml' -t True --postfix ROHQD_gpus1 --num-nodes 1 --random-seed True --debug True

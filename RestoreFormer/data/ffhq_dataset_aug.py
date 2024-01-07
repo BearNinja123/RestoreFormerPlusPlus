@@ -92,16 +92,12 @@ class FFHQAugDataset(data.Dataset):
                 break
             finally:
                 retry -= 1
-        #img_gt = imfrombytes(img_bytes, float32=True)
-        img_gt = imfrombytes(img_bytes) # stored as uint8
+        img_gt = imfrombytes(img_bytes, float32=True)
+        #img_gt = imfrombytes(img_bytes) # stored as uint8 RGB
 
         # random horizontal flip
         img_gt = augment(img_gt, hflip=self.opt['use_hflip'], rotation=False)
         h, w, _ = img_gt.shape
-
-        #if (self.exposure_prob is not None) and (np.random.uniform() < self.exposure_prob):
-        #        exp_scale = np.random.uniform(self.exposure_range[0], self.exposure_range[1])
-        #        img_gt *= exp_scale
 
         if (self.shift_prob is not None) and (np.random.uniform() < self.shift_prob ):
             # self.shift_unit = 32
@@ -117,23 +113,19 @@ class FFHQAugDataset(data.Dataset):
 
         # BGR to RGB, HWC to CHW, numpy to tensor
         #img_gt = img2tensor(img_gt, bgr2rgb=True, float32=True)
-        img_gt = img2tensor(img_gt, bgr2rgb=False, float32=False)
+        img_gt = img2tensor(img_gt, bgr2rgb=False, float32=True) # is already rgb
         # normalize
-        #normalize(img_gt, self.mean, self.std, inplace=True)
-        #normalize(img_gt, 255 * exp_scale * self.mean, 255 * exp_scale * self.std, inplace=True)
-        #return {'gt': img_gt, 'gt_path': gt_path}
+        normalize(img_gt, self.mean, self.std, inplace=True)
 
         # random to gray (only for lq)
         exp_scale = 1.0
         if (self.exposure_prob is not None) and (np.random.uniform() < self.exposure_prob):
             exp_scale = np.random.uniform(self.exposure_range[0], self.exposure_range[1])
-            #img_gt *= exp_scale
+            img_gt *= exp_scale
         if self.gray_prob and np.random.uniform() < self.gray_prob:
-            #img_gt = cv2.cvtColor(img_gt, cv2.COLOR_RGB2GRAY)
-            #img_gt = np.tile(img_gt[:, :, None], [1, 1, 3])
             img_gt = rgb_to_grayscale(img_gt, num_output_channels=3)
 
-        return {'gt': img_gt, 'gt_path': gt_path, 'mean': exp_scale * self.mean, 'rstd': 1 / (exp_scale * self.std)}
+        return {'gt': img_gt, 'gt_path': gt_path}
 
     def __len__(self):
         return len(self.paths)

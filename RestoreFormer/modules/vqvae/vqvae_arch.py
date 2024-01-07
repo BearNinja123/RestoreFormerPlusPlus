@@ -266,7 +266,7 @@ class MultiHeadDecoder(nn.Module):
     def __init__(self, ch, out_ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
                  attn_resolutions=16, dropout=0.0, resamp_with_conv=True, in_channels=3,
                  resolution=512, z_channels=256, give_pre_end=False, enable_mid=True,
-                 head_size=1, **ignorekwargs):
+                 head_size=1, ex_multi_scale_num=0, **ignorekwargs):
         super().__init__()
         self.ch = ch
         self.ref_ch = ref_ch
@@ -276,6 +276,7 @@ class MultiHeadDecoder(nn.Module):
         self.in_channels = in_channels
         self.give_pre_end = give_pre_end
         self.enable_mid = enable_mid
+        self.ex_multi_scale_num = ex_multi_scale_num
 
         # compute in_ch_mult, block_in and curr_res at lowest res
         curr_res = resolution // 2**(self.num_resolutions-1)
@@ -338,8 +339,11 @@ class MultiHeadDecoder(nn.Module):
             for i_block in range(self.num_res_blocks+1):
                 h = up_level.block[i_block](h, temb)
                 if len(up_level.attn) > 0:
-                    if hs is None:
+                    # outer layers of the decoder do not have multi-scale fusion
+                    if (hs is None) or (i_level >= self.ex_multi_scale_num):
                         h = up_level.attn[i_block](h)
+
+                    # inner layers have multi-scale fusion
                     elif 'block_'+str(i_level)+'_atten' in hs: # at this point hs is defined
                         h = up_level.attn[i_block](h, hs['block_'+str(i_level)+'_atten'])
                     else:
@@ -388,23 +392,16 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
                                resolution=resolution, z_channels=z_channels, double_z=double_z, 
                                enable_mid=enable_mid, head_size=head_size)
-        for i in range(ex_multi_scale_num):
-                attn_resolutions = [attn_resolutions[0], attn_resolutions[-1]*2]
-        self.decoder = MultiHeadDecoder(ch=ch, out_ch=out_ch, ref_ch=ref_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
-                               attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
-                               resolution=resolution, z_channels=z_channels, enable_mid=enable_mid, head_size=head_size)
-
-        self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
 
         self.quant_conv = torch.nn.Conv2d(z_channels, embed_dim, 1)
         self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
         self.post_quant_conv = torch.nn.Conv2d(embed_dim, z_channels, 1)
 
-        for i in range(ex_multi_scale_num):
-                attn_resolutions = [attn_resolutions[0], attn_resolutions[-1]*2]
+        #for i in range(ex_multi_scale_num):
+        #        attn_resolutions = [attn_resolutions[0], attn_resolutions[-1]*2]
         self.decoder = MultiHeadDecoder(ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
-                               resolution=resolution, z_channels=z_channels, enable_mid=enable_mid, head_size=head_size)
+                               resolution=resolution, z_channels=z_channels, enable_mid=enable_mid, head_size=head_size, ex_multi_scale_num=ex_multi_scale_num)
 
         if fix_encoder:
             for _, param in self.encoder.named_parameters():

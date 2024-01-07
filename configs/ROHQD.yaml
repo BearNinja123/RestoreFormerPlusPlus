@@ -36,12 +36,13 @@ model:
         codebook_weight: 1.0
         identity_weight: 1.5
         use_actnorm: False
+        identity_model_path: /scratch/tnguy231/RFExperiments/pretrained_models/arcface_resnet18.pth
 
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 12 # per device
-    num_workers: 3
+    batch_size: 16 # per device
+    num_workers: 7
     train:
       target: RestoreFormer.data.ffhq_dataset_aug.FFHQAugDataset
       params:
@@ -49,8 +50,8 @@ data:
         io_backend:
           type: disk
         use_hflip: True
-        mean: [127.5, 127.5, 127.5]
-        std: [127.5, 127.5, 127.5]
+        mean: [0.5, 0.5, 0.5]
+        std: [0.5, 0.5, 0.5]
         out_size: 512
         gray_prob: 0.008
         gt_gray: True
