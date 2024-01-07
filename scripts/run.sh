@@ -23,7 +23,7 @@ python -u main.py \
 --num-nodes $node_n \
 --random-seed True \
 --no-test True \
---debug True \
+--debug False \
 #--enable-profiler False
 
 #--root-path '/scratch/tnguy231/RFExperiments/tnguy231' --base 'configs/ROHQD.yaml' -t True --postfix ROHQD_gpus1 --num-nodes 1 --random-seed True --debug True

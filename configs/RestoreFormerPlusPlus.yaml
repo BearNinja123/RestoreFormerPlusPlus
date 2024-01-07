@@ -37,7 +37,7 @@ model:
         disc_start: 10001
         disc_weight: 1.0
         codebook_weight: 1.0
-        identity_weight: 1.0
+        identity_weight: 1.5
         use_actnorm: False
         #comp_weight: [1.0, 1.0, 1.0, 0]
         #comp_weight: 1.0
