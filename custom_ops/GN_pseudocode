@@ -1,10 +1,10 @@
 FORWARD
 T (threads per block) = 128 (or 256)
-X = NHWC input -> N(HWd)gG where g = 128 / G, d = D / g
+X = NHWC input -> N(HWd)gG where gG = T, dg = D
   strides: (HWD)G, gG, G, 1
-N blocks, (x=G, y=d) threads per block
+N blocks, (x=G, y=g) threads per block
 each block processes one sample in the batch
-each thread processes HWD / d elements for one group
+each thread processes HWd elements for one group
 
 means, rstds = empty(N, 1, G)
 

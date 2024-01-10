@@ -1,5 +1,6 @@
 #include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
 #include <ATen/native/cuda/Loops.cuh>
+#include <c10/core/Device.h>
 #include <c10/core/DeviceType.h>
 #include <c10/core/ScalarType.h>
 #include <c10/cuda/CUDAMathCompat.h> // rsqrt
@@ -10,7 +11,7 @@
 #include <thrust/pair.h>
 #include <cuda.h>
 #include <vector>
-#define THREADS_PER_BLOCK 1024
+#define THREADS_PER_BLOCK 512
 
 // Reduces a value across the y-threads of a threadblock
 template <typename T, class ReduceOp>
@@ -18,12 +19,12 @@ __device__ void
 y_reduce(
     T val,
     const ReduceOp& op,
-    //const T& identity_element,
     T* output_buffer
     ) {
   int tid = threadIdx.y * blockDim.x + threadIdx.x;
   output_buffer[tid] = val;
   __syncthreads();
+
   for (int stride = (int)(blockDim.x * blockDim.y / 2); stride >= (int)blockDim.x; stride >>= 1) {
     if (tid < stride)
       output_buffer[tid] = op.combine(output_buffer[tid], output_buffer[tid + stride]);
@@ -43,23 +44,23 @@ compute_stats(
         T* rstds
   ) {
   using T_ACC = at::acc_type<T, true>;
-  //using WelfordType = at::native::WelfordData<T_ACC, int64_t>;
-  //using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int64_t, thrust::pair<T_ACC, T_ACC>>;
   using WelfordType = at::native::WelfordData<T_ACC, int>;
   using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
 
   WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
   WelfordType val(0, 0, 0, 0);
 
-  const int g = blockDim.y;
-  for (int i = 0; i < HWd; ++i) {
-    const int reduce_idx = i * g * G + threadIdx.y * G + threadIdx.x;
-    T x = X[blockIdx.x * HWd * G + reduce_idx];
-    val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // check last arg, probably wrong
-  }
-
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[THREADS_PER_BLOCK];
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
+
+  const int HWC = HWd * THREADS_PER_BLOCK;
+#pragma unroll
+  for (int i = 0; i < HWd; ++i) {
+    const int reduce_idx = i * THREADS_PER_BLOCK + threadIdx.y * G + threadIdx.x;
+    T x = X[blockIdx.x * HWC + reduce_idx];
+    val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
+  }
+
   y_reduce(val, welford_op, vals_reduced);
   if (threadIdx.y == 0) {
     T_ACC m1, m2;
@@ -187,6 +188,7 @@ compute_backward_params(
   const int nc = blockIdx.x * G + threadIdx.x; // [bix][tx]
   const int ng = blockIdx.x * G + (threadIdx.x % G);
 
+#pragma unroll
   for (int i = 0; i < HWd; ++i) {
     int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
     T_ACC gamma_v = static_cast<T_ACC>(weight[nc]);
@@ -233,6 +235,7 @@ backward_weight_bias(
   const int Hw = HW / c;
   const int ng = blockIdx.x * G + threadIdx.x % G; // [bix][i][ty][tx]
 
+#pragma unroll
   for (int i = 0; i < Hw; ++i) {
     int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
     T_ACC dy_elem = static_cast<T_ACC>(dy[index]);
@@ -246,10 +249,90 @@ backward_weight_bias(
   sum_reduce(dbias_sum, reduced_dbias, blockDim.x);
 
   if (threadIdx.y == 0) {
-    dweight[threadIdx.x] = reduced_dweight[threadIdx.x];
-    dbias[threadIdx.x] = reduced_dbias[threadIdx.x];
+    dweight[blockIdx.x * C + threadIdx.x] = reduced_dweight[threadIdx.x];
+    dbias[blockIdx.x * C + threadIdx.x] = reduced_dbias[threadIdx.x];
   }
 }
+
+/*
+template <typename T>
+__global__ void
+compute_backward_params_weight_bias(
+        const T* dy,    // N x HWD x G
+        const T* X,     // N x HWD x G
+        const T* means, // N x G
+        const T* rstds, // N x G
+        const T* weight, // C (DG) (C)
+        const int HW,
+        const int C,
+        const int G,
+        at::acc_type<T, true>* coef2,
+        at::acc_type<T, true>* coef3) {
+  using T_ACC = at::acc_type<T, true>;
+  T_ACC sum1 = 0;
+  T_ACC sum2 = 0;
+  const int HWD = HW * C / G;
+  const int HWd = HW * C / THREADS_PER_BLOCK;
+  const int nc = blockIdx.x * G + threadIdx.x; // [bix][tx]
+  const int ng = blockIdx.x * G + (threadIdx.x % G);
+
+#pragma unroll
+  for (int i = 0; i < HWd; ++i) {
+    int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
+    T_ACC gamma_v = static_cast<T_ACC>(weight[nc]);
+    T_ACC dy_elem = static_cast<T_ACC>(dy[index]);
+    T_ACC X_elem = static_cast<T_ACC>(X[index]);
+    sum1 += dy_elem * X_elem * gamma_v; // sum1 = sum(X * gamma * dy)
+    sum2 += dy_elem * gamma_v; // sum1 = sum(X * gamma * dy)
+
+    //dweight_sum += dy_elem * (static_cast<T_ACC>(X[index]) - static_cast<T_ACC>(means[ng])) * static_cast<T_ACC>(rstds[ng]);
+    //dbias_sum += dy_elem;
+  }
+
+  __shared__ T_ACC reduced_sum1[THREADS_PER_BLOCK];
+  __shared__ T_ACC reduced_sum2[THREADS_PER_BLOCK];
+  sum_reduce(sum1, reduced_sum1, G);
+  sum_reduce(sum2, reduced_sum2, G);
+
+  if (threadIdx.y == 0 && (int)threadIdx.x < G) {
+    sum1 = reduced_sum1[threadIdx.x];
+    sum2 = reduced_sum2[threadIdx.x];
+
+    T_ACC mean = static_cast<T_ACC>(means[ng]);
+    T_ACC rstd = static_cast<T_ACC>(rstds[ng]);
+    T_ACC x = (sum2 * static_cast<T_ACC>(means[ng]) - sum1) * rstd * rstd * rstd / HWD; // AKA -sum(norm(X[ng])[i] * gamma[g] * dy[ngi], i) / std[ng]^2 / D
+    coef2[ng] = x;
+    float c3a = -x * mean; // AKA sum(norm(X[ngi]) * gamma[g] * dy[ngi] * mean[ng], i)
+    float c3b = -sum2 * rstd / HWD; // AKA -gamma * sum(dy) / std[ng] / D
+    coef3[ng] = c3a + c3b;
+  }
+
+  T_ACC dweight_sum = 0;
+  T_ACC dbias_sum = 0;
+
+  const int c = THREADS_PER_BLOCK / C;
+  const int Hw = HW / c;
+
+#pragma unroll
+  for (int i = 0; i < Hw; ++i) {
+    int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
+    T_ACC dy_elem = static_cast<T_ACC>(dy[index]);
+    dweight_sum += dy_elem * (static_cast<T_ACC>(X[index]) - static_cast<T_ACC>(means[ng])) * static_cast<T_ACC>(rstds[ng]);
+    dbias_sum += dy_elem;
+  }
+
+  __shared__ T_ACC reduced_dweight[THREADS_PER_BLOCK];
+  __shared__ T_ACC reduced_dbias[THREADS_PER_BLOCK];
+  sum_reduce(dweight_sum, reduced_dweight, blockDim.x);
+  sum_reduce(dbias_sum, reduced_dbias, blockDim.x);
+
+  if (threadIdx.y == 0) {
+    dweight[blockIdx.x * C + threadIdx.x] = reduced_dweight[threadIdx.x];
+    dbias[blockIdx.x * C + threadIdx.x] = reduced_dbias[threadIdx.x];
+    //atomicAdd(dweight + threadIdx.x, reduced_dweight[threadIdx.x]);
+    //atomicAdd(dbias + threadIdx.x, reduced_dbias[threadIdx.x]);
+  }
+}*/
 
 template <typename T>
 void gn_nhwc_backward_kernel(
@@ -268,8 +351,8 @@ void gn_nhwc_backward_kernel(
   const T* weight_data = weight.const_data_ptr<T>();
   const T* mean_data = means.const_data_ptr<T>();
   const T* rstd_data = rstds.const_data_ptr<T>();
-  T* dweight_data = dweight.mutable_data_ptr<T>();
-  T* dbias_data = dbias.mutable_data_ptr<T>();
+  //T* dweight_data = dweight.mutable_data_ptr<T>();
+  //T* dbias_data = dbias.mutable_data_ptr<T>();
 
   const int N = X_nhwc.size(0);
   const int H = X_nhwc.size(1);
@@ -277,6 +360,11 @@ void gn_nhwc_backward_kernel(
   const int C = X_nhwc.size(3);
   const int D = C / G;
   const int g = THREADS_PER_BLOCK / G;
+
+  torch::Tensor dweight_tmp = torch::zeros({N, C}).to(means.device());
+  torch::Tensor dbias_tmp = torch::zeros({N, C}).to(dbias.device());
+  T* dweight_tmpdata = dweight_tmp.mutable_data_ptr<T>();
+  T* dbias_tmpdata = dbias_tmp.mutable_data_ptr<T>();
 
   torch::Tensor coef2 = at::empty({N, G}, X_nhwc.options());
   torch::Tensor coef3 = at::empty({N, G}, X_nhwc.options());
@@ -304,13 +392,19 @@ void gn_nhwc_backward_kernel(
 
   at::native::gpu_kernel(iter, [] GPU_LAMBDA(T dy, T x, T weight, T rstd, T_ACC coef2, T_ACC coef3) -> T {
       const T_ACC c1 = static_cast<T_ACC>(rstd) * static_cast<T_ACC>(weight);
-      return (c1 * static_cast<T_ACC>(dy)) + (coef2 * static_cast<T_ACC>(x)) + coef3;
+      T_ACC result1 = (coef2 * static_cast<T_ACC>(x)) + coef3; // fma
+      return (c1 * static_cast<T_ACC>(dy)) + result1; // fma
     });
 
   backward_weight_bias<T><<<N, dim3(C, THREADS_PER_BLOCK / C)>>>(
       dy_data, X_data, mean_data, rstd_data, 
       H * W, C, G,
-      dweight_data, dbias_data);
+      dweight_tmpdata, dbias_tmpdata);
+      //dweight_data, dbias_data);
+
+  // would like to use atomic adds but they just don't work for some reason (some nan values), also this doesn't impact speed/mem usage much
+  dweight = dweight_tmp.sum(0);
+  dbias = dbias_tmp.sum(0);
 
   AT_CUDA_CHECK(cudaGetLastError());
 }
@@ -322,12 +416,13 @@ std::vector<torch::Tensor> gn_nhwc_cuda_backward(
     const torch::Tensor& means,
     const torch::Tensor& rstds,
     const int G) {
+  //const int N = X.size(0);
   const int C = X.size(1);
   const torch::Tensor X_nhwc = X.permute({0, 2, 3, 1});
   const torch::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
   torch::Tensor dx = torch::zeros_like(dy_nhwc);
-  torch::Tensor dgamma = torch::zeros({C}).to(dy.device());
-  torch::Tensor dbeta = torch::zeros({C}).to(dy.device());
+  torch::Tensor dgamma = torch::empty({C}).to(dy.device());
+  torch::Tensor dbeta = torch::empty({C}).to(dy.device());
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
     at::ScalarType::Half,

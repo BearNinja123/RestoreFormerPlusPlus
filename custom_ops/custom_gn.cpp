@@ -1,6 +1,33 @@
 #include <torch/extension.h>
 #include <torch/torch.h>
 //#include <iostream>
+//
+void GroupNormKernelImpl(
+    const torch::Tensor& X,
+    const torch::Tensor& gamma,
+    const torch::Tensor& beta,
+    int64_t N,
+    int64_t C,
+    int64_t HxW,
+    int64_t group,
+    double eps,
+    torch::Tensor& Y,
+    torch::Tensor& mean,
+    torch::Tensor& rstd);
+
+void GroupNormBackwardKernelImpl(
+    const torch::Tensor& dY,
+    const torch::Tensor& X,
+    const torch::Tensor& mean,
+    const torch::Tensor& rstd,
+    const torch::Tensor& gamma,
+    int64_t N,
+    int64_t C,
+    int64_t HxW,
+    int64_t group,
+    torch::Tensor& dX,
+    torch::Tensor& dgamma,
+    torch::Tensor& dbeta);
 
 std::vector<torch::Tensor> gn_nhwc_cuda_forward(
     const torch::Tensor& X,
@@ -45,7 +72,64 @@ std::vector<torch::Tensor> gn_nhwc_backward(
   return gn_nhwc_cuda_backward(dy, X, weight, means, rstds, G);
 }
 
+std::vector<torch::Tensor> gn_nchw_forward(
+    const torch::Tensor X,
+    const torch::Tensor weight,
+    const torch::Tensor bias,
+    const int G,
+    float eps) {
+  CHECK_CUDA(X);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(bias);
+  const int N = X.size(0);
+  const int C = X.size(1);
+  const int H = X.size(2);
+  const int W = X.size(3);
+  torch::Tensor Y = torch::zeros_like(X);
+  torch::Tensor mean = torch::zeros({N, G}).to(X.device());
+  torch::Tensor rstd = torch::zeros({N, G}).to(X.device());
+  GroupNormKernelImpl(
+    X, weight, bias,
+    N, C, H * W,
+    G,
+    eps,
+    Y,
+    mean,
+    rstd);
+  return {Y, mean, rstd};
+}
+
+std::vector<torch::Tensor> gn_nchw_backward(
+    const torch::Tensor dy,
+    const torch::Tensor X,
+    const torch::Tensor weight,
+    const torch::Tensor means,
+    const torch::Tensor rstds,
+    const int G) {
+  CHECK_CUDA(dy);
+  CHECK_CUDA(X);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(means);
+  CHECK_CUDA(rstds);
+  const int N = X.size(0);
+  const int C = X.size(1);
+  const int H = X.size(2);
+  const int W = X.size(3);
+  torch::Tensor dX = torch::zeros_like(X);
+  torch::Tensor dgamma = torch::zeros_like(weight);
+  torch::Tensor dbeta = torch::zeros_like(weight);
+  GroupNormBackwardKernelImpl(
+      dy, X,
+      means, rstds, weight,
+      N, C, H * W, G,
+      dX, dgamma, dbeta);
+
+  return {dX, dgamma, dbeta};
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("forward", &gn_nhwc_forward, "GN NHWC backward");
+  m.def("forward", &gn_nhwc_forward, "GN NHWC forward");
   m.def("backward", &gn_nhwc_backward, "GN NHWC backward");
+  m.def("nchwforward", &gn_nchw_forward, "GN NCHW forward");
+  m.def("nchwbackward", &gn_nchw_backward, "GN NCHW backward");
 }
