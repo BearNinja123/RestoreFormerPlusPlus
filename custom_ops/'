@@ -55,7 +55,7 @@ compute_stats(
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
 
   const int HWC = HWd * THREADS_PER_BLOCK;
-#pragma unroll 8
+#pragma unroll 4
   for (int i = 0; i < HWd; ++i) {
     const int reduce_idx = i * THREADS_PER_BLOCK + threadIdx.y * G + threadIdx.x;
     T x = X[blockIdx.x * HWC + reduce_idx];
@@ -235,7 +235,7 @@ compute_backward_params(
   const int c = threadIdx.x; // [bix][tx]
   const int ng = blockIdx.x * G + (threadIdx.x % G);
 
-#pragma unroll 8
+#pragma unroll 4
   for (int i = 0; i < HWd; ++i) {
     int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
     T_ACC gamma_v = static_cast<T_ACC>(weight[c]);
@@ -282,7 +282,7 @@ backward_weight_bias(
   const int Hw = HW / c;
   const int ng = blockIdx.x * G + threadIdx.x % G; // [bix][i][ty][tx]
 
-#pragma unroll 8
+#pragma unroll 4
   for (int i = 0; i < Hw; ++i) {
     int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
     T_ACC dy_elem = static_cast<T_ACC>(dy[index]);
