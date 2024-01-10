@@ -5,6 +5,7 @@
 #include <c10/core/ScalarType.h>
 #include <c10/cuda/CUDAMathCompat.h> // rsqrt
 #include <ATen/AccumulateType.h> // acc_type
+#include <ATen/ATen.h>
 #include <string>
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -134,8 +135,8 @@ void gn_nhwc_forward_kernel(
       ? at::kFloat
       : X.scalar_type();
 
-  torch::Tensor a = at::empty({N, C}, X.options().dtype(kAccType));
-  torch::Tensor b = at::empty({N, C}, X.options().dtype(kAccType));
+  torch::Tensor a = torch::empty({N, C}, X.options().dtype(kAccType));
+  torch::Tensor b = torch::empty({N, C}, X.options().dtype(kAccType));
   T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
   T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
   
@@ -146,13 +147,10 @@ void gn_nhwc_forward_kernel(
       a_data, b_data);
 
   at::TensorIterator iter = at::TensorIteratorConfig()
+    .check_all_same_dtype(std::is_same<T, T_ACC>::value) // this line relaxes requirement that all inputs/outputs are same dtype if T isn't T_ACC 
     .resize_outputs(false)
     .add_owned_output(Y.view({N, H * W, D, G}))
     .add_owned_input(X.view({N, H * W, D, G}))
-    //.add_owned_input(means.view({N, 1, 1, G}))
-    //.add_owned_input(rstds.view({N, 1, 1, G}))
-    //.add_owned_input(weight.view({1, 1, D, G}))
-    //.add_owned_input(bias.view({1, 1, D, G}))
     .add_owned_input(a.view({N, 1, D, G}))
     .add_owned_input(b.view({N, 1, D, G}))
     .build();
@@ -175,8 +173,8 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward(
 
   torch::Tensor X_nhwc = X.permute({0, 2, 3, 1});
   torch::Tensor X_out = torch::empty_like(X_nhwc);
-  torch::Tensor means = torch::empty({N, G}).to(X.device());
-  torch::Tensor rstds = torch::empty({N, G}).to(X.device());
+  torch::Tensor means = torch::empty({N, G}, weight.options());
+  torch::Tensor rstds = torch::empty({N, G}, weight.options());
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
     at::ScalarType::Half,
@@ -234,13 +232,13 @@ compute_backward_params(
   T_ACC sum2 = 0;
   const int HWD = HW * C / G;
   const int HWd = HW * C / THREADS_PER_BLOCK;
-  const int nc = blockIdx.x * G + threadIdx.x; // [bix][tx]
+  const int c = threadIdx.x; // [bix][tx]
   const int ng = blockIdx.x * G + (threadIdx.x % G);
 
 #pragma unroll
   for (int i = 0; i < HWd; ++i) {
     int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
-    T_ACC gamma_v = static_cast<T_ACC>(weight[nc]);
+    T_ACC gamma_v = static_cast<T_ACC>(weight[c]);
     sum1 += static_cast<T_ACC>(dy[index]) * static_cast<T_ACC>(X[index]) * gamma_v; // sum1 = sum(X * gamma * dy)
     sum2 += static_cast<T_ACC>(dy[index]) * gamma_v; // sum1 = sum(X * gamma * dy)
   }
@@ -274,8 +272,8 @@ backward_weight_bias(
         const int HW,
         const int C,
         const int G,
-        T* dweight,
-        T* dbias) {
+        at::acc_type<T, true>* dweight,
+        at::acc_type<T, true>* dbias) {
   using T_ACC = at::acc_type<T, true>;
   T_ACC dweight_sum = 0;
   T_ACC dbias_sum = 0;
@@ -400,8 +398,6 @@ void gn_nhwc_backward_kernel(
   const T* weight_data = weight.const_data_ptr<T>();
   const T* mean_data = means.const_data_ptr<T>();
   const T* rstd_data = rstds.const_data_ptr<T>();
-  //T* dweight_data = dweight.mutable_data_ptr<T>();
-  //T* dbias_data = dbias.mutable_data_ptr<T>();
 
   const int N = X_nhwc.size(0);
   const int H = X_nhwc.size(1);
@@ -410,13 +406,18 @@ void gn_nhwc_backward_kernel(
   const int D = C / G;
   const int g = THREADS_PER_BLOCK / G;
 
-  torch::Tensor dweight_tmp = torch::empty({N, C}).to(means.device());
-  torch::Tensor dbias_tmp = torch::empty({N, C}).to(dbias.device());
-  T* dweight_tmpdata = dweight_tmp.mutable_data_ptr<T>();
-  T* dbias_tmpdata = dbias_tmp.mutable_data_ptr<T>();
+  const at::ScalarType kAccType =
+      (X_nhwc.scalar_type() == at::kHalf || X_nhwc.scalar_type() == at::kBFloat16)
+      ? at::kFloat
+      : X_nhwc.scalar_type();
 
-  torch::Tensor coef2 = at::empty({N, G}, X_nhwc.options());
-  torch::Tensor coef3 = at::empty({N, G}, X_nhwc.options());
+  torch::Tensor dweight_tmp = torch::empty({N, C}, dweight.options().dtype(kAccType));
+  torch::Tensor dbias_tmp = torch::empty({N, C}, dbias.options().dtype(kAccType));
+  T_ACC* dweight_tmpdata = dweight_tmp.mutable_data_ptr<T_ACC>();
+  T_ACC* dbias_tmpdata = dbias_tmp.mutable_data_ptr<T_ACC>();
+
+  torch::Tensor coef2 = torch::empty({N, G}, X_nhwc.options().dtype(kAccType));
+  torch::Tensor coef3 = torch::empty({N, G}, X_nhwc.options().dtype(kAccType));
   T_ACC* coef2_data = coef2.mutable_data_ptr<T_ACC>();
   T_ACC* coef3_data = coef3.mutable_data_ptr<T_ACC>();
 
@@ -430,6 +431,7 @@ void gn_nhwc_backward_kernel(
 
   at::TensorIterator iter = at::TensorIteratorConfig()
     .resize_outputs(false)
+    .check_all_same_dtype(std::is_same<T, T_ACC>::value)
     .add_owned_output(dx.view({N, H * W, D, G}))
     .add_owned_input(dy_nhwc.view({N, H * W, D, G}))
     .add_owned_input(X_nhwc.view({N, H * W, D, G}))
@@ -449,11 +451,9 @@ void gn_nhwc_backward_kernel(
       dy_data, X_data, mean_data, rstd_data, 
       H * W, C, G,
       dweight_tmpdata, dbias_tmpdata);
-      //dweight_data, dbias_data);
 
-  // would like to use atomic adds but they just don't work for some reason (some nan values), also this doesn't impact speed/mem usage much
-  dweight = dweight_tmp.sum(0);
-  dbias = dbias_tmp.sum(0);
+  dweight = dweight_tmp.sum(0).to(dweight.scalar_type());
+  dbias = dbias_tmp.sum(0).to(dweight.scalar_type());
 
   AT_CUDA_CHECK(cudaGetLastError());
 }
@@ -470,8 +470,8 @@ std::vector<torch::Tensor> gn_nhwc_cuda_backward(
   const torch::Tensor X_nhwc = X.permute({0, 2, 3, 1});
   const torch::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
   torch::Tensor dx = torch::empty_like(dy_nhwc);
-  torch::Tensor dgamma = torch::empty({C}).to(dy.device());
-  torch::Tensor dbeta = torch::empty({C}).to(dy.device());
+  torch::Tensor dgamma = torch::empty({C}, dy.options());
+  torch::Tensor dbeta = torch::empty({C}, dy.options());
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
     at::ScalarType::Half,
