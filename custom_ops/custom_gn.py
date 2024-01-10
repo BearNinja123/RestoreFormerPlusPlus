@@ -131,18 +131,18 @@ if __name__ == '__main__':
     x_nchw = torch.randn((32, C, 128, 128)).cuda().requires_grad_(True)
     x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
     gn_args = (8, C)
-    PROF = 'bwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
+    PROF = 'both' # can be 'fwd', 'bwd', anything else is fwd + bwd
     for gn_class, gn_input, desc in (
             (GN_NHWC, x_nhwc, 'GN NHWC (custom op)'),
             #(GN_NCHW, x_nchw, 'GN NCHW'),
-            #(nn.GroupNorm, x_nchw, 'nn GN NCHW'),
-            (nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
+            (nn.GroupNorm, x_nchw, 'nn GN NCHW'),
+            #(nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
             #(GN_NHWCRef, x_nhwc, 'GN NHWC (reference)'),
             ):
         print(desc, PROF)
         gn_layer = gn_class(*gn_args).cuda()
         g = gn_layer(gn_input)
-        for i in tqdm(range(100), smoothing=1):
+        for i in tqdm(range(2), smoothing=1):
             if PROF != 'bwd':
                 g = gn_layer(gn_input)
             if PROF != 'fwd':

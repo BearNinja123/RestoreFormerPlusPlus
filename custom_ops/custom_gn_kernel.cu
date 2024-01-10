@@ -11,7 +11,7 @@
 #include <thrust/pair.h>
 #include <cuda.h>
 #include <vector>
-#define THREADS_PER_BLOCK 512
+#define THREADS_PER_BLOCK 512 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
 
 // Reduces a value across the y-threads of a threadblock
 template <typename T, class ReduceOp>
@@ -70,6 +70,33 @@ compute_stats(
   }
 }
 
+/*
+   In the fwd, there is a (X - mean) * rstd * weight + bias which requires an add, mul, fma op on each elem on X
+   The above eqn can be rewritten as:
+     X * rstd * weight - mean * rstd * weight + bias ->
+     X * a + b (a = rstd * weight, b = -mean * rstd * weight + bias)
+    The X * a + b eqn uses only one fma per elem on X, making it faster than the original eqn since a, b doesn't have to be repeated for each elem of X
+*/
+template <typename T>
+__global__ void
+compute_scale_biases(
+        T* means,  // (N, G)
+        T* rstds,  // (N, G)
+        const T* weight, // (C)
+        const T* bias,   // (C)
+        const int G,
+        const int C,
+        at::acc_type<T, true>* a,            // (N, C)
+        at::acc_type<T, true>* b             // (N, C)
+  ) {
+  const int c = threadIdx.x;
+  const int g = threadIdx.x % G;
+  const int nc = blockIdx.x * C + c;
+  const int ng = blockIdx.x * G + g;
+  a[nc] = rstds[ng] * weight[c];
+  b[nc] = -means[ng] * rstds[ng] * weight[c] + bias[c];
+}
+
 template <typename T>
 void gn_nhwc_forward_kernel(
     const torch::Tensor& X,
@@ -84,6 +111,8 @@ void gn_nhwc_forward_kernel(
   const T* X_data = X.const_data_ptr<T>();
   T* mean_data = means.mutable_data_ptr<T>();
   T* rstd_data = rstds.mutable_data_ptr<T>();
+  const T* weight_data = weight.const_data_ptr<T>();
+  const T* bias_data = bias.const_data_ptr<T>();
 
   const int N = X.size(0);
   const int H = X.size(1);
@@ -100,18 +129,38 @@ void gn_nhwc_forward_kernel(
       mean_data, rstd_data
   );
 
+  const at::ScalarType kAccType =
+      (X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16)
+      ? at::kFloat
+      : X.scalar_type();
+
+  torch::Tensor a = at::empty({N, C}, X.options().dtype(kAccType));
+  torch::Tensor b = at::empty({N, C}, X.options().dtype(kAccType));
+  T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
+  T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
+  
+  compute_scale_biases<<<N, C>>>(
+      mean_data, rstd_data,
+      weight_data, bias_data,
+      G, C,
+      a_data, b_data);
+
   at::TensorIterator iter = at::TensorIteratorConfig()
     .resize_outputs(false)
     .add_owned_output(Y.view({N, H * W, D, G}))
     .add_owned_input(X.view({N, H * W, D, G}))
-    .add_owned_input(means.view({N, 1, 1, G}))
-    .add_owned_input(rstds.view({N, 1, 1, G}))
-    .add_owned_input(weight.view({1, 1, D, G}))
-    .add_owned_input(bias.view({1, 1, D, G}))
+    //.add_owned_input(means.view({N, 1, 1, G}))
+    //.add_owned_input(rstds.view({N, 1, 1, G}))
+    //.add_owned_input(weight.view({1, 1, D, G}))
+    //.add_owned_input(bias.view({1, 1, D, G}))
+    .add_owned_input(a.view({N, 1, D, G}))
+    .add_owned_input(b.view({N, 1, D, G}))
     .build();
 
-  at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T weight, T bias) -> T {
-      return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) * static_cast<T_ACC>(rstd) * static_cast<T_ACC>(weight) + static_cast<T_ACC>(bias);
+  //at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T weight, T bias) -> T {
+  at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T_ACC a, T_ACC b) -> T {
+      //return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) * static_cast<T_ACC>(rstd) * static_cast<T_ACC>(weight) + static_cast<T_ACC>(bias);
+      return static_cast<T_ACC>(x) * a + b;
       });
   AT_CUDA_CHECK(cudaGetLastError());
 }
@@ -125,9 +174,9 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward(
   const int N = X.size(0);
 
   torch::Tensor X_nhwc = X.permute({0, 2, 3, 1});
-  torch::Tensor X_out = torch::zeros_like(X_nhwc);
-  torch::Tensor means = torch::zeros({N, G}).to(X.device());
-  torch::Tensor rstds = torch::zeros({N, G}).to(X.device());
+  torch::Tensor X_out = torch::empty_like(X_nhwc);
+  torch::Tensor means = torch::empty({N, G}).to(X.device());
+  torch::Tensor rstds = torch::empty({N, G}).to(X.device());
 
   AT_DISPATCH_FLOATING_TYPES_AND2(
     at::ScalarType::Half,
@@ -361,8 +410,8 @@ void gn_nhwc_backward_kernel(
   const int D = C / G;
   const int g = THREADS_PER_BLOCK / G;
 
-  torch::Tensor dweight_tmp = torch::zeros({N, C}).to(means.device());
-  torch::Tensor dbias_tmp = torch::zeros({N, C}).to(dbias.device());
+  torch::Tensor dweight_tmp = torch::empty({N, C}).to(means.device());
+  torch::Tensor dbias_tmp = torch::empty({N, C}).to(dbias.device());
   T* dweight_tmpdata = dweight_tmp.mutable_data_ptr<T>();
   T* dbias_tmpdata = dbias_tmp.mutable_data_ptr<T>();
 
@@ -420,7 +469,7 @@ std::vector<torch::Tensor> gn_nhwc_cuda_backward(
   const int C = X.size(1);
   const torch::Tensor X_nhwc = X.permute({0, 2, 3, 1});
   const torch::Tensor dy_nhwc = dy.permute({0, 2, 3, 1});
-  torch::Tensor dx = torch::zeros_like(dy_nhwc);
+  torch::Tensor dx = torch::empty_like(dy_nhwc);
   torch::Tensor dgamma = torch::empty({C}).to(dy.device());
   torch::Tensor dbeta = torch::empty({C}).to(dy.device());
 

@@ -85,9 +85,9 @@ std::vector<torch::Tensor> gn_nchw_forward(
   const int C = X.size(1);
   const int H = X.size(2);
   const int W = X.size(3);
-  torch::Tensor Y = torch::zeros_like(X);
-  torch::Tensor mean = torch::zeros({N, G}).to(X.device());
-  torch::Tensor rstd = torch::zeros({N, G}).to(X.device());
+  torch::Tensor Y = torch::empty_like(X);
+  torch::Tensor mean = torch::empty({N, G}).to(X.device());
+  torch::Tensor rstd = torch::empty({N, G}).to(X.device());
   GroupNormKernelImpl(
     X, weight, bias,
     N, C, H * W,
@@ -115,9 +115,9 @@ std::vector<torch::Tensor> gn_nchw_backward(
   const int C = X.size(1);
   const int H = X.size(2);
   const int W = X.size(3);
-  torch::Tensor dX = torch::zeros_like(X);
-  torch::Tensor dgamma = torch::zeros_like(weight);
-  torch::Tensor dbeta = torch::zeros_like(weight);
+  torch::Tensor dX = torch::empty_like(X);
+  torch::Tensor dgamma = torch::empty_like(weight);
+  torch::Tensor dbeta = torch::empty_like(weight);
   GroupNormBackwardKernelImpl(
       dy, X,
       means, rstds, weight,
