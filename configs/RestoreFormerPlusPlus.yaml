@@ -3,27 +3,26 @@ model:
   target: RestoreFormer.models.vqgan_v1.RestoreFormerModel
   params:
     image_key: 'lq'
-    ckpt_path: 'YOUR TRAINED HD DICTIONARY MODEL'
+    ckpt_path: '/scratch/tnguy231/RFExperiments/tnguy231/logs/2024-01-06T13-50-41_ROHQDROHQD_gpus1_seed26/checkpoints/epoch=000079.ckpt'
     special_params_lr_scale: 10
     comp_params_lr_scale: 10
     schedule_step: [4000000, 8000000]
     ddconfig:
       target: RestoreFormer.modules.vqvae.vqvae_arch.VQVAEGANMultiHeadTransformer
       params:
-        embed_dim: 256
-        n_embed: 1024
+        embed_dim: 512
+        n_embed: 4096
         double_z: False
-        z_channels: 256
+        z_channels: 512
         resolution: 512
         in_channels: 3  
         out_ch: 3
         ch: 64
-        ch_mult: [ 1,2,2,4,4,8]  # num_down = len(ch_mult)-1
+        ch_mult: [1,2,2,4,4,8]  # num_down = len(ch_mult)-1
         num_res_blocks: 2
+        attn_resolutions: [16, 32, 64, 128]
         dropout: 0.0
-        attn_resolutions: [16]
         enable_mid: True
-
         fix_decoder: False
         fix_codebook: True
         fix_encoder: False
@@ -36,22 +35,24 @@ model:
         disc_conditional: False
         disc_in_channels: 3
         disc_start: 10001
-        disc_weight: 0.8
+        disc_weight: 1.0
         codebook_weight: 1.0
+        identity_weight: 1.5
         use_actnorm: False
-        comp_weight: [1.0, 1.0, 1.0, 0]
-        identity_weight: 1.0
-        identity_model_path: experiments/pretrained_models/arcface_resnet18.pth
+        #comp_weight: [1.0, 1.0, 1.0, 0]
+        #comp_weight: 1.0
+        #comp_style_weight: 0.0
+        identity_model_path: /scratch/tnguy231/RFExperiments/pretrained_models/arcface_resnet18.pth
 
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 4
-    num_workers: 8
+    batch_size: 16 # per device
+    num_workers: 7
     train:
-      target: RestoreFormer.data.ffhq_degradation_dataset.FFHQUnevenDegradationDataset
+      target: RestoreFormer.data.ffhq_uneven_degradation_dataset.FFHQUnevenDegradationDataset
       params:
-        dataroot_gt: data/FFHQ/images512x512
+        dataroot_gt: /scratch/tnguy231/FFHQ/image512x512
         io_backend:
           type: disk
         use_hflip: True
@@ -87,14 +88,14 @@ data:
         hazy_alpha: [0.75, 0.95]
 
         crop_components: True
-        component_path: experiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
+        component_path: /scratch/tnguy231/RFExperiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
         eye_enlarge_ratio: 1.4
 
 
     validation:
       target: RestoreFormer.data.ffhq_degradation_dataset.FFHQDegradationDataset
       params:
-        dataroot_gt: data/FFHQ/images512x512
+        dataroot_gt: /scratch/tnguy231/FFHQ/image512x512
         io_backend:
           type: disk
         use_hflip: False
@@ -131,5 +132,13 @@ data:
         hazy_alpha: [0.75, 0.95]
 
         crop_components: False
-        component_path: experiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
+        component_path: /scratch/tnguy231/RFExperiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
         eye_enlarge_ratio: 1.4
+
+lightning:
+  trainer:
+    #devices: "0," # commenting this out defaults to using all GPUs from CUDA_VISIBLE_DEVICES
+    accelerator: cuda
+    precision: bf16-true
+    accumulate_grad_batches: 1
+    #max_steps: 256

@@ -92,11 +92,13 @@ class RestoreFormerModel(pl.LightningModule):
     and access your optimizers in `training_step` with `opt1, opt2, ... = self.optimizers()`.
     '''
     def training_step(self, batch, batch_idx):
-        x = (batch[self.image_key] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+        #x = (batch[self.image_key] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+        x = batch[self.image_key]
         xrec, qloss, info, hs, penult = self(x)
 
         if self.image_key != 'gt':
-            x = (batch['gt'].to(self.device) - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+            #x = (batch['gt'].to(self.device) - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+            x = batch['gt'].to(self.device)
 
         if self.use_facial_disc:
             loc_left_eyes = batch['loc_left_eye']
@@ -135,17 +137,17 @@ class RestoreFormerModel(pl.LightningModule):
             s.step()
 
     def validation_step(self, batch, batch_idx):
-        x = (batch[self.image_key] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+        #x = (batch[self.image_key] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+        x = batch[self.image_key]
         xrec, qloss, _info, _hs, _penult = self(x)
 
         if self.image_key != 'gt':
-            x = (batch['gt'] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+            #x = (batch['gt'] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+            x = batch['gt']
 
-        aeloss, log_dict_ae = self.loss(qloss, x, xrec, None, 0, self.global_step,
+        aeloss, _discloss, _d_left_eye_loss, _d_right_eye_loss, _d_mouth_loss, log_dict_ae = self.loss(qloss, x, xrec, None, self.global_step,
                                             last_layer=self.get_last_layer(), split="val")
 
-        discloss, log_dict_disc = self.loss(qloss, x, xrec, None, 1, self.global_step,
-                                            last_layer=None, split="val")
         rec_loss = log_dict_ae["val/rec_loss"]
         self.log("val/rec_loss", rec_loss,
                    prog_bar=True, logger=True, on_step=True, on_epoch=True, sync_dist=True)
@@ -168,8 +170,8 @@ class RestoreFormerModel(pl.LightningModule):
                 normal_params.append(param)
         opt_ae_params = [{'params': normal_params, 'lr': lr},
                          {'params': special_params, 'lr': lr*self.special_params_lr_scale}]
-        #opt_ae = torch.optim.Adam(opt_ae_params, betas=(0.5, 0.9), fused=True)
-        opt_ae = torch.optim.Adam(self.vqvae.parameters(), betas=(0.5, 0.9), fused=True)
+        opt_ae = torch.optim.Adam(opt_ae_params, betas=(0.5, 0.9), fused=True)
+        #opt_ae = torch.optim.Adam(self.vqvae.parameters(), betas=(0.5, 0.9), fused=True)
         opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
                                     lr=lr, betas=(0.5, 0.9), fused=True)
 
@@ -204,14 +206,16 @@ class RestoreFormerModel(pl.LightningModule):
     def log_images(self, batch, **kwargs):
         self.vqvae.eval()
         log = dict()
-        x = (batch[self.image_key].to(self.device) - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+        #x = (batch[self.image_key].to(self.device) - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+        x = batch[self.image_key].to(self.device)
         xrec, _qloss, _info, _hs, _penult = self(x)
         self.vqvae.train()
         log["inputs"] = x
         log["reconstructions"] = xrec
 
         if self.image_key != 'gt':
-            x = (batch['gt'] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+            #x = (batch['gt'] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+            x = batch['gt']
             log["gt"] = x
         return log
 

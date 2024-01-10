@@ -352,6 +352,15 @@ class ProgressBar(TQDMProgressBar):
             bar_format=self.BAR_FORMAT,
         )
 
+# this strategy is needed since optimizers change throughout training (e.g. ROHQD trains the codebooks whereas RF++ doesn't)
+class MyStrategy(pl.strategies.DDPStrategy):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, find_unused_parameters=True, **kwargs)
+    
+    @property
+    def lightning_restore_optimizer(self):
+        return False
+
 if __name__ == "__main__":
     # custom parser to specify config files, train, test and debug mode,
     # postfix, resume.
@@ -529,7 +538,7 @@ if __name__ == "__main__":
             modelckpt_cfg = OmegaConf.create()
         modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
         trainer_kwargs["callbacks"] = [instantiate_from_config(modelckpt_cfg)]
-        trainer_kwargs["strategy"] = 'ddp_find_unused_parameters_true'
+        trainer_kwargs["strategy"] = MyStrategy()
         trainer_kwargs["default_root_dir"] = logdir
 
         if opt.enable_profiler:
