@@ -67,6 +67,9 @@ class GN_NHWC(nn.GroupNorm):
         super().__init__(num_groups, nc, **kwargs)
 
     def forward(self, x):
+        #print(x.shape, self.num_channels)
+        if x[0].numel() % 512 != 0:
+            raise ValueError(f'X[0] has shape {x[0].shape} which is not a multiple of 512. This input is not supported.')
         if self.affine:
             return GN_NHWC_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps)
         else:
@@ -112,9 +115,9 @@ if __name__ == '__main__':
     fp16: 
     bf16: 
     '''
-    C = 256
+    C = 512
     DTYPE = torch.float
-    MODE = 'check' # can be 'check', 'bench', default does both
+    MODE = 'bench' # can be 'check', 'bench', default does both
 
     if MODE != 'bench':
         #x = torch.arange(C).reshape((1, C, 1, 1)).float().cuda().requires_grad_(True)
@@ -157,13 +160,15 @@ if __name__ == '__main__':
         print(g1_grad_wrt_b - g2_grad_wrt_b)
 
     if MODE != 'check':
-        x_nchw = torch.randn((32, C, 128, 128), dtype=DTYPE, device='cuda').requires_grad_(True)
+        #x_nchw = torch.randn((32, C, 128, 128), dtype=DTYPE, device='cuda').requires_grad_(True)
+        x_nchw = torch.randn((8, C, 8, 8), dtype=DTYPE, device='cuda').requires_grad_(True)
         x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
         gn_args = (32, C)
         #gn_args = (C,)
-        BENCH = 'both' # can be 'fwd', 'bwd', anything else is fwd + bwd
+        BENCH = 'bwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
         for gn_class, gn_input, desc in (
                 (GN_NHWC, x_nhwc, 'GN NHWC (custom op)'),
+                #(GN_NCHW, x_nchw, 'nn GN NCHW'),
                 #(nn.BatchNorm2d, x_nhwc, 'BN NHWC'),
                 #(nn.BatchNorm2d, x_nchw, 'BN NCHW'),
                 (nn.GroupNorm, x_nchw, 'nn GN NCHW'),
@@ -173,7 +178,7 @@ if __name__ == '__main__':
             print(desc, BENCH)
             gn_layer = gn_class(*gn_args).cuda().to(DTYPE)
             g = gn_layer(gn_input)
-            for i in tqdm(range(100)):
+            for i in tqdm(range(1)):
                 if BENCH != 'bwd':
                     g = gn_layer(gn_input)
                 if BENCH != 'fwd':

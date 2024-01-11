@@ -12,7 +12,7 @@
 #include <thrust/pair.h>
 #include <cuda.h>
 #include <vector>
-#define THREADS_PER_BLOCK 512 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
+#define THREADS_PER_BLOCK 32 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
 
 // Reduces a value across the y-threads of a threadblock
 template <typename T, class ReduceOp>
@@ -57,7 +57,11 @@ compute_stats(
   const int HWC = HWd * THREADS_PER_BLOCK;
 #pragma unroll 8
   for (int i = 0; i < HWd; ++i) {
-    const int reduce_idx = i * THREADS_PER_BLOCK + threadIdx.y * G + threadIdx.x;
+    int reduce_idx;
+    if (THREADS_PER_BLOCK >= G)
+      reduce_idx = i * THREADS_PER_BLOCK + threadIdx.y * G + threadIdx.x;
+    else
+      reduce_idx = i * G + blockIdx.y * THREADS_PER_BLOCK + threadIdx.x;
     T x = X[blockIdx.x * HWC + reduce_idx];
     val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
   }
@@ -66,8 +70,10 @@ compute_stats(
   if (threadIdx.y == 0) {
     T_ACC m1, m2;
     thrust::tie(m2, m1) = welford_op.project(vals_reduced[threadIdx.x]);
-    means[blockIdx.x * G + threadIdx.x] = m1;
-    rstds[blockIdx.x * G + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
+    //means[blockIdx.x * G + threadIdx.x] = m1;
+    //rstds[blockIdx.x * G + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
+    means[blockIdx.x * G + blockIdx.y * THREADS_PER_BLOCK + threadIdx.x] = m1;
+    rstds[blockIdx.x * G + blockIdx.y * THREADS_PER_BLOCK + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
   }
 }
 
@@ -90,8 +96,8 @@ compute_scale_biases(
         at::acc_type<T, true>* a,            // (N, C)
         at::acc_type<T, true>* b             // (N, C)
   ) {
-  const int c = threadIdx.x;
-  const int g = threadIdx.x % G;
+  const int c = blockIdx.y * THREADS_PER_BLOCK + threadIdx.x;
+  const int g = c % G;
   const int nc = blockIdx.x * C + c;
   const int ng = blockIdx.x * G + g;
   a[nc] = rstds[ng] * weight[c];
@@ -120,11 +126,22 @@ void gn_nhwc_forward_kernel(
   const int W = X.size(2);
   const int C = X.size(3);
   const int D = C / G;
-  const int g = THREADS_PER_BLOCK / G;
-  const int HWd = H * W * D / g;
+  int blockDimX, blockDimY, gridDimY;
+  if (THREADS_PER_BLOCK >= G) {
+    blockDimX = G;
+    blockDimY = THREADS_PER_BLOCK / G;
+    gridDimY = 1;
+  }
+  else {
+    blockDimX = THREADS_PER_BLOCK;
+    blockDimY = 1;
+    gridDimY = G / THREADS_PER_BLOCK;
+  }
+  const int HWd = H * W * D / blockDimY;
 
-  const dim3 dimGrid(N);
-  const dim3 dimBlock(G, g);
+  dim3 dimGrid(N, gridDimY);
+  //const dim3 dimGrid(N);
+  dim3 dimBlock(blockDimX, blockDimY);
   compute_stats<T><<<dimGrid, dimBlock>>>(
       X_data, G, HWd, eps,
       mean_data, rstd_data
@@ -140,7 +157,17 @@ void gn_nhwc_forward_kernel(
   T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
   T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
   
-  compute_scale_biases<<<N, C>>>(
+  if (THREADS_PER_BLOCK >= C) {
+    blockDimX = C;
+    blockDimY = THREADS_PER_BLOCK / C;
+    gridDimY = 1;
+  }
+  else {
+    blockDimX = THREADS_PER_BLOCK;
+    blockDimY = 1;
+    gridDimY = C / THREADS_PER_BLOCK;
+  }
+  compute_scale_biases<<<dim3(N, gridDimY), dim3(blockDimX, blockDimY)>>>(
       mean_data, rstd_data,
       weight_data, bias_data,
       G, C,
@@ -216,93 +243,6 @@ sum_reduce(
 
 template <typename T>
 __global__ void
-compute_backward_params(
-        const T* dy,    // N x HWD x G
-        const T* X,     // N x HWD x G
-        const T* means, // N x G
-        const T* rstds, // N x G
-        const T* weight, // C (DG) (C)
-        const int HW,
-        const int C,
-        const int G,
-        at::acc_type<T, true>* coef2,
-        at::acc_type<T, true>* coef3) {
-  using T_ACC = at::acc_type<T, true>;
-  T_ACC sum1 = 0;
-  T_ACC sum2 = 0;
-  const int HWD = HW * C / G;
-  const int HWd = HW * C / THREADS_PER_BLOCK;
-  const int c = threadIdx.x; // [bix][tx]
-  const int ng = blockIdx.x * G + (threadIdx.x % G);
-
-#pragma unroll 8
-  for (int i = 0; i < HWd; ++i) {
-    int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
-    T_ACC gamma_v = static_cast<T_ACC>(weight[c]);
-    sum1 += static_cast<T_ACC>(dy[index]) * static_cast<T_ACC>(X[index]) * gamma_v; // sum1 = sum(X * gamma * dy)
-    sum2 += static_cast<T_ACC>(dy[index]) * gamma_v; // sum1 = sum(X * gamma * dy)
-  }
-
-  __shared__ T_ACC reduced_sum1[THREADS_PER_BLOCK];
-  __shared__ T_ACC reduced_sum2[THREADS_PER_BLOCK];
-  sum_reduce(sum1, reduced_sum1, G);
-  sum_reduce(sum2, reduced_sum2, G);
-
-  if (threadIdx.y == 0 && (int)threadIdx.x < G) {
-    sum1 = reduced_sum1[threadIdx.x];
-    sum2 = reduced_sum2[threadIdx.x];
-
-    T_ACC mean = static_cast<T_ACC>(means[ng]);
-    T_ACC rstd = static_cast<T_ACC>(rstds[ng]);
-    T_ACC x = (sum2 * static_cast<T_ACC>(means[ng]) - sum1) * rstd * rstd * rstd / HWD; // AKA -sum(norm(X[ng])[i] * gamma[g] * dy[ngi], i) / std[ng]^2 / D
-    coef2[ng] = x;
-    float c3a = -x * mean; // AKA sum(norm(X[ngi]) * gamma[g] * dy[ngi] * mean[ng], i)
-    float c3b = -sum2 * rstd / HWD; // AKA -gamma * sum(dy) / std[ng] / D
-    coef3[ng] = c3a + c3b;
-  }
-}
-
-template <typename T>
-__global__ void
-backward_weight_bias(
-        const T* dy,
-        const T* X,
-        const T* means,
-        const T* rstds,
-        const int HW,
-        const int C,
-        const int G,
-        at::acc_type<T, true>* dweight,
-        at::acc_type<T, true>* dbias) {
-  using T_ACC = at::acc_type<T, true>;
-  T_ACC dweight_sum = 0;
-  T_ACC dbias_sum = 0;
-
-  const int c = THREADS_PER_BLOCK / C;
-  const int Hw = HW / c;
-  const int ng = blockIdx.x * G + threadIdx.x % G; // [bix][i][ty][tx]
-
-#pragma unroll 8
-  for (int i = 0; i < Hw; ++i) {
-    int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // [bix][i][ty][tx]
-    T_ACC dy_elem = static_cast<T_ACC>(dy[index]);
-    dweight_sum += dy_elem * (static_cast<T_ACC>(X[index]) - static_cast<T_ACC>(means[ng])) * static_cast<T_ACC>(rstds[ng]);
-    dbias_sum += dy_elem;
-  }
-
-  __shared__ T_ACC reduced_dweight[THREADS_PER_BLOCK];
-  __shared__ T_ACC reduced_dbias[THREADS_PER_BLOCK];
-  sum_reduce(dweight_sum, reduced_dweight, blockDim.x);
-  sum_reduce(dbias_sum, reduced_dbias, blockDim.x);
-
-  if (threadIdx.y == 0) {
-    dweight[blockIdx.x * C + threadIdx.x] = reduced_dweight[threadIdx.x];
-    dbias[blockIdx.x * C + threadIdx.x] = reduced_dbias[threadIdx.x];
-  }
-}
-
-template <typename T>
-__global__ void
 compute_backward_params_weight_bias(
         const T* dy,    // N x HWD x G
         const T* X,     // N x HWD x G
@@ -319,19 +259,24 @@ compute_backward_params_weight_bias(
         ) {
   using T_ACC = at::acc_type<T, true>;
   const int HWD = HW * C / G;
-  const int ng = blockIdx.x * G + (threadIdx.x % G);
-  const int c_idx = threadIdx.x;
+  //const int c_idx = THREADS_PER_BLOCK >= C ? threadIdx.x : blockIdx.y * THREADS_PER_BLOCK + threadIdx.x;
+  const int c_idx = blockIdx.y * THREADS_PER_BLOCK + threadIdx.x;
   const int g = c_idx % G;
-  const int c = THREADS_PER_BLOCK / C;
-  const int Hw = HW / c;
+  const int ng = blockIdx.x * G + g;
+  const int Hw = HW / blockDim.y;
   T_ACC dweight_sum = 0;
   T_ACC dbias_sum = 0;
   T_ACC sum1 = 0;
   T_ACC sum2 = 0;
 
-#pragma unroll
+#pragma unroll 8
   for (int i = 0; i < Hw; ++i) {
-    int index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + c_idx; // [bix][i][ty][tx]
+    int index;
+    if (THREADS_PER_BLOCK >= C)
+      index = blockIdx.x * HW*C + i * THREADS_PER_BLOCK + threadIdx.y * C + c_idx; // [bix][i][ty][tx]
+    else
+      index = blockIdx.x * HW*C + i * C + c_idx; // [bix][i][ty][tx]
+
     T_ACC gamma_v = static_cast<T_ACC>(weight[c_idx]);
     T_ACC dy_elem = static_cast<T_ACC>(dy[index]);
     T_ACC X_elem = static_cast<T_ACC>(X[index]);
@@ -344,31 +289,36 @@ compute_backward_params_weight_bias(
 
   __shared__ T_ACC reduced_sum1[THREADS_PER_BLOCK];
   __shared__ T_ACC reduced_sum2[THREADS_PER_BLOCK];
-  sum_reduce(sum1, reduced_sum1, G);
-  sum_reduce(sum2, reduced_sum2, G);
+  int num_elems = THREADS_PER_BLOCK >= G ? G : THREADS_PER_BLOCK;
+  sum_reduce(sum1, reduced_sum1, num_elems);
+  sum_reduce(sum2, reduced_sum2, num_elems);
 
   if (threadIdx.y == 0 && (int)threadIdx.x < G) {
+    const int ntg = blockIdx.x * G * gridDim.y + blockIdx.y * G + g;
     sum1 = reduced_sum1[g];
     sum2 = reduced_sum2[g];
 
     T_ACC mean = static_cast<T_ACC>(means[ng]);
     T_ACC rstd = static_cast<T_ACC>(rstds[ng]);
     T_ACC x = (sum2 * static_cast<T_ACC>(means[ng]) - sum1) * rstd * rstd * rstd / HWD; // AKA -sum(norm(X[ng])[i] * gamma[g] * dy[ngi], i) / std[ng]^2 / D
-    coef2[ng] = x;
+    //coef2[ng] = x;
+    coef2[ntg] = x;
     float c3a = -x * mean; // AKA sum(norm(X[ngi]) * gamma[g] * dy[ngi] * mean[ng], i)
     float c3b = -sum2 * rstd / HWD; // AKA -gamma * sum(dy) / std[ng] / D
-    coef3[ng] = c3a + c3b;
+    //coef3[ng] = c3a + c3b;
+    coef3[ntg] = c3a + c3b;
   }
 
   // new aliases for shmem arrays for different reductions
   T_ACC* reduced_dweight = reduced_sum1;
   T_ACC* reduced_dbias = reduced_sum2;
-  sum_reduce(dweight_sum, reduced_dweight, C);
-  sum_reduce(dbias_sum, reduced_dbias, C);
+  num_elems = THREADS_PER_BLOCK >= C ? C : THREADS_PER_BLOCK;
+  sum_reduce(dweight_sum, reduced_dweight, num_elems);
+  sum_reduce(dbias_sum, reduced_dbias, num_elems);
 
   if (threadIdx.y == 0) {
-    dweight[blockIdx.x * C + threadIdx.x] = reduced_dweight[threadIdx.x];
-    dbias[blockIdx.x * C + threadIdx.x] = reduced_dbias[threadIdx.x];
+    dweight[blockIdx.x * C + blockIdx.y * THREADS_PER_BLOCK + threadIdx.x] = reduced_dweight[threadIdx.x];
+    dbias[blockIdx.x * C + blockIdx.y * THREADS_PER_BLOCK + threadIdx.x] = reduced_dbias[threadIdx.x];
   }
 }
 
@@ -395,7 +345,6 @@ void gn_nhwc_backward_kernel(
   const int W = X_nhwc.size(2);
   const int C = X_nhwc.size(3);
   const int D = C / G;
-  //const int g = THREADS_PER_BLOCK / G;
 
   const at::ScalarType kAccType =
       (X_nhwc.scalar_type() == at::kHalf || X_nhwc.scalar_type() == at::kBFloat16)
@@ -407,30 +356,46 @@ void gn_nhwc_backward_kernel(
   T_ACC* dweight_tmpdata = dweight_tmp.mutable_data_ptr<T_ACC>();
   T_ACC* dbias_tmpdata = dbias_tmp.mutable_data_ptr<T_ACC>();
 
-  torch::Tensor coef2 = torch::empty({N, G}, X_nhwc.options().dtype(kAccType));
-  torch::Tensor coef3 = torch::empty({N, G}, X_nhwc.options().dtype(kAccType));
-  T_ACC* coef2_data = coef2.mutable_data_ptr<T_ACC>();
-  T_ACC* coef3_data = coef3.mutable_data_ptr<T_ACC>();
+  int blockDimX, blockDimY, gridDimY;
+  if (THREADS_PER_BLOCK >= C) {
+    blockDimX = C;
+    blockDimY = THREADS_PER_BLOCK / C;
+    gridDimY = 1;
+  }
+  else {
+    blockDimX = THREADS_PER_BLOCK;
+    blockDimY = 1;
+    gridDimY = C / THREADS_PER_BLOCK;
+  }
 
-  //const dim3 dimGrid(N);
-  //const dim3 dimBlock(G, g);
-  //compute_backward_params<T><<<N, dim3(C, THREADS_PER_BLOCK / C)>>>(
-  //    dy_data, X_data, mean_data, rstd_data, weight_data,
-  //    H * W, C, G,
-  //    coef2_data, coef3_data
-  //);
+  torch::Tensor coef1 = torch::empty({N, C}, X_nhwc.options().dtype(kAccType));
+  torch::Tensor coef2_tmp = torch::empty({N, gridDimY, G}, X_nhwc.options().dtype(kAccType));
+  torch::Tensor coef3_tmp = torch::empty({N, gridDimY, G}, X_nhwc.options().dtype(kAccType));
+  T_ACC* coef2_tmpdata = coef2_tmp.mutable_data_ptr<T_ACC>();
+  T_ACC* coef3_tmpdata = coef3_tmp.mutable_data_ptr<T_ACC>();
 
-  //backward_weight_bias<T><<<N, dim3(C, THREADS_PER_BLOCK / C)>>>(
-  //    dy_data, X_data, mean_data, rstd_data, 
-  //    H * W, C, G,
-  //    dweight_tmpdata, dbias_tmpdata);
-
-  compute_backward_params_weight_bias<<<N, dim3(C, THREADS_PER_BLOCK / C)>>>(
+  compute_backward_params_weight_bias<<<dim3(N, gridDimY), dim3(blockDimX, blockDimY)>>>(
+  //int c = THREADS_PER_BLOCK / C;
+  //compute_backward_params_weight_bias<<<N, dim3(C, c)>>>(
           dy_data, X_data,
           mean_data, rstd_data, weight_data,
           H * W, C, G,
-          coef2_data, coef3_data,
+          coef2_tmpdata, coef3_tmpdata,
           dweight_tmpdata, dbias_tmpdata);
+
+  torch::Tensor coef2 = coef2_tmp.sum(1);
+  torch::Tensor coef3 = coef3_tmp.sum(1);
+
+  at::TensorIterator coef1_iter = at::TensorIteratorConfig()
+    .check_all_same_dtype(std::is_same<T, T_ACC>::value)
+    .add_owned_output(coef1.view({N, D, G}))
+    .add_owned_input(rstds.view({N, 1, G}))
+    .add_owned_input(weight.view({1, D, G}))
+    .build();
+
+  at::native::gpu_kernel(coef1_iter, [] GPU_LAMBDA(T rstd, T gamma) -> T_ACC {
+    return static_cast<T_ACC>(rstd) * static_cast<T_ACC>(gamma);
+  });
 
   at::TensorIterator iter = at::TensorIteratorConfig()
     .resize_outputs(false)
@@ -438,16 +403,14 @@ void gn_nhwc_backward_kernel(
     .add_owned_output(dx.view({N, H * W, D, G}))
     .add_owned_input(dy_nhwc.view({N, H * W, D, G}))
     .add_owned_input(X_nhwc.view({N, H * W, D, G}))
-    .add_owned_input(weight.view({1, 1, D, G}))
-    .add_owned_input(rstds.view({N, 1, 1, G}))
+    .add_owned_input(coef1.view({N, 1, D, G}))
     .add_owned_input(coef2.view({N, 1, 1, G}))
     .add_owned_input(coef3.view({N, 1, 1, G}))
     .build();
 
-  at::native::gpu_kernel(iter, [] GPU_LAMBDA(T dy, T x, T weight, T rstd, T_ACC coef2, T_ACC coef3) -> T {
-      const T_ACC c1 = static_cast<T_ACC>(rstd) * static_cast<T_ACC>(weight);
-      T_ACC result1 = (coef2 * static_cast<T_ACC>(x)) + coef3; // fma
-      return (c1 * static_cast<T_ACC>(dy)) + result1; // fma
+  at::native::gpu_kernel(iter, [] GPU_LAMBDA(T dy, T x, T_ACC coef1, T_ACC coef2, T_ACC coef3) -> T {
+      T_ACC result1 = (coef2 * x) + coef3; // fma
+      return (coef1 * dy) + result1; // fma
     });
 
   dweight = dweight_tmp.sum(0).to(dweight.scalar_type());
