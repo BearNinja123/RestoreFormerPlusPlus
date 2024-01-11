@@ -2,12 +2,25 @@ import torch.nn.functional as F
 import torch.nn as nn
 import torch
 from tqdm import tqdm
-import time
+import time, os
 torch.set_printoptions(sci_mode=False)
+module_dir = os.path.dirname(os.path.abspath(__file__))
 
 print('Started loading module')
 from torch.utils.cpp_extension import load
-gn_op = load(name="gn_op", sources=["custom_gn.cpp", "custom_gn_kernel.cu", "nchw_kernel.cu"], extra_cuda_cflags=['--extended-lambda', '-use_fast_math', '-lineinfo'])
+gn_op = load(
+        name="gn_op",
+        sources=[
+            os.path.join(module_dir, "custom_gn.cpp"),
+            os.path.join(module_dir, "custom_gn_kernel.cu"),
+            os.path.join(module_dir, "nchw_kernel.cu")
+            ],
+        extra_cuda_cflags=[
+            '--extended-lambda',
+            '-use_fast_math',
+            '-lineinfo'
+            ]
+        )
 print('Finished loading module')
 
 class GN_NHWCRefRef(nn.GroupNorm):
@@ -101,7 +114,7 @@ if __name__ == '__main__':
     '''
     C = 256
     DTYPE = torch.float
-    MODE = 'bench' # can be 'check', 'bench', default does both
+    MODE = 'check' # can be 'check', 'bench', default does both
 
     if MODE != 'bench':
         #x = torch.arange(C).reshape((1, C, 1, 1)).float().cuda().requires_grad_(True)
@@ -153,7 +166,7 @@ if __name__ == '__main__':
                 (GN_NHWC, x_nhwc, 'GN NHWC (custom op)'),
                 #(nn.BatchNorm2d, x_nhwc, 'BN NHWC'),
                 #(nn.BatchNorm2d, x_nchw, 'BN NCHW'),
-                #(nn.GroupNorm, x_nchw, 'nn GN NCHW'),
+                (nn.GroupNorm, x_nchw, 'nn GN NCHW'),
                 #(nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
                 #(GN_NHWCRef, x_nhwc, 'GN NHWC (reference)'),
                 ):
