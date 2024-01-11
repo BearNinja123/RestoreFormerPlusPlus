@@ -147,12 +147,14 @@ if __name__ == '__main__':
         x_nchw = torch.randn((32, C, 128, 128), dtype=DTYPE, device='cuda').requires_grad_(True)
         x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
         gn_args = (32, C)
+        #gn_args = (C,)
         BENCH = 'both' # can be 'fwd', 'bwd', anything else is fwd + bwd
         for gn_class, gn_input, desc in (
                 (GN_NHWC, x_nhwc, 'GN NHWC (custom op)'),
-                #(GN_NCHW, x_nchw, 'GN NCHW'),
+                #(nn.BatchNorm2d, x_nhwc, 'BN NHWC'),
+                #(nn.BatchNorm2d, x_nchw, 'BN NCHW'),
                 #(nn.GroupNorm, x_nchw, 'nn GN NCHW'),
-                (nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
+                #(nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
                 #(GN_NHWCRef, x_nhwc, 'GN NHWC (reference)'),
                 ):
             print(desc, BENCH)
@@ -162,5 +164,9 @@ if __name__ == '__main__':
                 if BENCH != 'bwd':
                     g = gn_layer(gn_input)
                 if BENCH != 'fwd':
-                    torch.autograd.grad(g.sum(), gn_input, retain_graph=True)
+                    if 'NHWC' in desc:
+                        g_mem_fmt = g.contiguous(memory_format=torch.channels_last) # in NHWC models, must convert possibly NCHW outputs into NHWC (i.e. from nn GN), note that this is a no-op if g is already in NHWC format (e.g. GN_NHWC output)
+                    else:
+                        g_mem_fmt = g.contiguous()
+                    torch.autograd.grad(g_mem_fmt.sum(), gn_input, retain_graph=True)
                 torch.cuda.synchronize()
