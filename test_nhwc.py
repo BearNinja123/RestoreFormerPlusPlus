@@ -4,33 +4,35 @@ import torch.nn as nn
 import torch
 import time
 
-print(torch._dynamo.list_backends(None))
-print(torch._dynamo.list_backends())
-
 DTYPE = torch.bfloat16
 m_ = VQVAEGAN(attn_resolutions=[16], enable_mid=True).to('cuda', dtype=DTYPE)
 print(sum(p.numel() for p in m_.parameters()))
-#x = torch.rand((8, 3, 512, 512), device='cuda', dtype=torch.bfloat16)
-x = torch.rand((8, 3, 256, 256), device='cuda', dtype=DTYPE)
+x = torch.rand((4, 3, 256, 256), device='cuda', dtype=DTYPE)
 
 COMPILE = False
+BWD = True
 comp = lambda m: torch.compile(m,
         #mode='reduce-overhead',
-        backend='cudagraphs',
         #fullgraph=True,
         )
 
+NWARMUP = 5
+NTRIAL = 10
 #with torch.no_grad():
 if COMPILE:
     m = comp(m_)
 else:
     m = m_
-for i in tqdm(range(5), smoothing=1):
-    m(x)[0].sum().backward()
+for i in tqdm(range(NWARMUP), smoothing=1):
+    y = m(x)[0]
+    if BWD:
+        y.sum().backward()
     torch.cuda.synchronize()
 tic = time.time()
-for i in tqdm(range(5), smoothing=1):
-    m(x)[0].sum().backward()
+for i in tqdm(range(NTRIAL), smoothing=1):
+    y = m(x)[0]
+    if BWD:
+        y.sum().backward()
     torch.cuda.synchronize()
 print('nchw', time.time() - tic)
 
@@ -40,11 +42,15 @@ if COMPILE:
     m = comp(m)
 else:
     m = m
-for i in tqdm(range(5), smoothing=1):
-    m(x)[0].sum().backward()
+for i in tqdm(range(NWARMUP), smoothing=1):
+    y = m(x)[0]
+    if BWD:
+        y.sum().backward()
     torch.cuda.synchronize()
 tic = time.time()
-for i in tqdm(range(5), smoothing=1):
-    m(x)[0].sum().backward()
+for i in tqdm(range(NTRIAL), smoothing=1):
+    y = m(x)[0]
+    if BWD:
+        y.sum().backward()
     torch.cuda.synchronize()
 print('nhwc', time.time() - tic)

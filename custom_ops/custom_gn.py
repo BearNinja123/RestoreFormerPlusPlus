@@ -160,7 +160,7 @@ if __name__ == '__main__':
         print(g1_grad_wrt_b - g2_grad_wrt_b)
 
     if MODE != 'check':
-        for B, C, R in ((32, 256, 128),):
+        for B, C, R in ((8, 512, 32),):
             #x_nchw = torch.randn((32, C, 128, 128), dtype=DTYPE, device='cuda').requires_grad_(True)
             x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda').requires_grad_(True)
             x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
@@ -178,14 +178,11 @@ if __name__ == '__main__':
                     ):
                 print(desc, BENCH)
                 gn_layer = gn_class(*gn_args).cuda().to(DTYPE)
-                #g = gn_layer(gn_input)
-                #torch.cuda.synchronize()
-                for i in tqdm(range(1)):
+                g = gn_layer(gn_input)
+                torch.cuda.synchronize()
+                for i in tqdm(range(10)):
                     if BENCH != 'bwd':
-                        if isinstance(gn_layer, GN_NCHW):
-                            g = gn_op.nchwforward(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                        else:
-                            g = gn_layer(gn_input)
+                        g = gn_layer(gn_input)
                     if BENCH != 'fwd':
                         if 'NHWC' in desc:
                             g_mem_fmt = g.contiguous(memory_format=torch.channels_last) # in NHWC models, must convert possibly NCHW outputs into NHWC (i.e. from nn GN), note that this is a no-op if g is already in NHWC format (e.g. GN_NHWC output)
