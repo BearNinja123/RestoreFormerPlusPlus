@@ -12,7 +12,7 @@
 #include <thrust/pair.h>
 #include <cuda.h>
 #include <vector>
-#define THREADS_PER_BLOCK 32 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
+#define THREADS_PER_BLOCK 512 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
 
 // Reduces a value across the y-threads of a threadblock
 template <typename T, class ReduceOp>

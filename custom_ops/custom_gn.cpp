@@ -86,8 +86,8 @@ std::vector<torch::Tensor> gn_nchw_forward(
   const int H = X.size(2);
   const int W = X.size(3);
   torch::Tensor Y = torch::empty_like(X);
-  torch::Tensor mean = torch::empty({N, G}).to(X.device());
-  torch::Tensor rstd = torch::empty({N, G}).to(X.device());
+  torch::Tensor mean = torch::empty({N, G}, X.options());
+  torch::Tensor rstd = torch::empty({N, G}, X.options());
   GroupNormKernelImpl(
     X, weight, bias,
     N, C, H * W,
