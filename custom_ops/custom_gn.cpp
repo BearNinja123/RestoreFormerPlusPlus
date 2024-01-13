@@ -36,6 +36,20 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward(
     const int G,
     float eps);
 
+std::vector<torch::Tensor> gn_nhwc_cuda_forward2(
+    const torch::Tensor& X,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const int G,
+    float eps);
+
+std::vector<torch::Tensor> gn_nhwc_cuda_forward3(
+    const torch::Tensor& X,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const int G,
+    float eps);
+
 std::vector<torch::Tensor> gn_nhwc_cuda_backward(
     const torch::Tensor& dy,
     const torch::Tensor& X,
@@ -55,6 +69,30 @@ std::vector<torch::Tensor> gn_nhwc_forward(
   CHECK_CUDA(weight);
   CHECK_CUDA(bias);
   return gn_nhwc_cuda_forward(X, weight, bias, G, eps);
+}
+
+std::vector<torch::Tensor> gn_nhwc_forward2(
+    const torch::Tensor X,
+    const torch::Tensor weight,
+    const torch::Tensor bias,
+    const int G,
+    float eps) {
+  CHECK_CUDA(X);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(bias);
+  return gn_nhwc_cuda_forward2(X, weight, bias, G, eps);
+}
+
+std::vector<torch::Tensor> gn_nhwc_forward3(
+    const torch::Tensor X,
+    const torch::Tensor weight,
+    const torch::Tensor bias,
+    const int G,
+    float eps) {
+  CHECK_CUDA(X);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(bias);
+  return gn_nhwc_cuda_forward3(X, weight, bias, G, eps);
 }
 
 std::vector<torch::Tensor> gn_nhwc_backward(
@@ -129,6 +167,8 @@ std::vector<torch::Tensor> gn_nchw_backward(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward", &gn_nhwc_forward, "GN NHWC forward");
+  m.def("forward2", &gn_nhwc_forward2, "GN NHWC forward2");
+  m.def("forward3", &gn_nhwc_forward3, "GN NHWC forward3");
   m.def("backward", &gn_nhwc_backward, "GN NHWC backward");
   m.def("nchwforward", &gn_nchw_forward, "GN NCHW forward");
   m.def("nchwbackward", &gn_nchw_backward, "GN NCHW backward");

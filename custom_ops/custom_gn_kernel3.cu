@@ -12,34 +12,24 @@
 #include <thrust/pair.h>
 #include <cuda.h>
 #include <vector>
-#define THREADS_PER_BLOCK 512 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
+#define THREADS_PER_BLOCK 128 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
 
 // Reduces a value across the y-threads of a threadblock
 template <typename T, class ReduceOp>
 __device__ void
-y_reduce(
+xz_reduce(
     T val,
     const ReduceOp& op,
     T* output_buffer
     ) {
-  int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  output_buffer[tid] = val;
-  __syncthreads();
-
-  for (int stride = (int)(blockDim.x * blockDim.y / 2); stride >= (int)blockDim.x; stride >>= 1) {
-    if (tid < stride)
-      output_buffer[tid] = op.combine(output_buffer[tid], output_buffer[tid + stride]);
-    __syncthreads();
-  }
-  // output_buffer[0..blockDim.x] will have reduced values
 }
-
 template <typename T>
 __global__ void
-compute_stats(
+compute_stats4(
         const T* X,
+        const int C,
         const int G,
-        const int HWd,
+        const int HWC,
         const float eps,
         T* means,
         T* rstds
@@ -47,6 +37,7 @@ compute_stats(
   using T_ACC = at::acc_type<T, true>;
   using WelfordType = at::native::WelfordData<T_ACC, int>;
   using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
+  // griddim = N, G, blockdim = d, D
 
   WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
   WelfordType val(0, 0, 0, 0);
@@ -54,39 +45,50 @@ compute_stats(
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[THREADS_PER_BLOCK];
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
 
-  const int HWC = HWd * THREADS_PER_BLOCK;
+  const int HWc = HWC / THREADS_PER_BLOCK;
 #pragma unroll 8
-  for (int i = 0; i < HWd; ++i) {
-    int reduce_idx;
-    if (THREADS_PER_BLOCK >= G)
-      reduce_idx = i * THREADS_PER_BLOCK + threadIdx.y * G + threadIdx.x;
-    else
-      reduce_idx = i * G + blockIdx.y * THREADS_PER_BLOCK + threadIdx.x;
-    T x = X[blockIdx.x * HWC + reduce_idx];
-    val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
+  for (int i = 0; i < HWc/4; ++i) {
+    int reduce_idx = i * THREADS_PER_BLOCK * 4 + threadIdx.y * C + threadIdx.x * 4; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
+    const float4 tmp = reinterpret_cast<const float4 *>(X + (blockIdx.x * HWC + reduce_idx))[0];
+    val = welford_op.reduce(val, static_cast<T_ACC>(tmp.x), reduce_idx); // last arg isn't used in src
+    val = welford_op.reduce(val, static_cast<T_ACC>(tmp.y), reduce_idx); // last arg isn't used in src
+    val = welford_op.reduce(val, static_cast<T_ACC>(tmp.z), reduce_idx); // last arg isn't used in src
+    val = welford_op.reduce(val, static_cast<T_ACC>(tmp.w), reduce_idx); // last arg isn't used in src
+
+    //int reduce_idx = i * THREADS_PER_BLOCK * G + threadIdx.y * D * G + blockIdx.y * D + threadIdx.x; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
+    //T x = X[blockIdx.x * HWC + reduce_idx];
+    //val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
   }
 
-  y_reduce(val, welford_op, vals_reduced);
-  if (threadIdx.y == 0) {
+  const int D = C / G;
+
+  // suppose vals_reduced shape is (c, G, D), we need (G,) output
+  // (c,G,D) -> (G,c,D) -> (G,)
+  int tid = threadIdx.y * blockDim.x + threadIdx.x;
+  const int c_idx = threadIdx.y;
+  const int g = threadIdx.x / D;
+  const int d = threadIdx.x % D;
+  vals_reduced[g * blockDim.y * D + c_idx * D + d] = val;
+  __syncthreads();
+
+  for (int stride = THREADS_PER_BLOCK / 2; stride >= G; stride >>= 1) {
+    if (tid < stride)
+      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
+    __syncthreads();
+    }
+
+  // put reduced outputs into return buffers
+  if ((int)threadIdx.x < G) {
     T_ACC m1, m2;
     thrust::tie(m2, m1) = welford_op.project(vals_reduced[threadIdx.x]);
-    //means[blockIdx.x * G + threadIdx.x] = m1;
-    //rstds[blockIdx.x * G + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
-    means[blockIdx.x * G + blockIdx.y * THREADS_PER_BLOCK + threadIdx.x] = m1;
-    rstds[blockIdx.x * G + blockIdx.y * THREADS_PER_BLOCK + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
+    means[blockIdx.x * G + threadIdx.x] = m1;
+    rstds[blockIdx.x * G + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
   }
 }
 
-/*
-   In the fwd, there is a (X - mean) * rstd * weight + bias which requires an add, mul, fma op on each elem on X
-   The above eqn can be rewritten as:
-     X * rstd * weight - mean * rstd * weight + bias ->
-     X * a + b (a = rstd * weight, b = -mean * rstd * weight + bias)
-    The X * a + b eqn uses only one fma per elem on X, making it faster than the original eqn since a, b doesn't have to be repeated for each elem of X
-*/
 template <typename T>
 __global__ void
-compute_scale_biases(
+compute_scale_biases3(
         T* means,  // (N, G)
         T* rstds,  // (N, G)
         const T* weight, // (C)
@@ -96,16 +98,20 @@ compute_scale_biases(
         at::acc_type<T, true>* a,            // (N, C)
         at::acc_type<T, true>* b             // (N, C)
   ) {
-  const int c = blockIdx.y * THREADS_PER_BLOCK + threadIdx.x;
-  const int g = c % G;
+  const int D = C / G;
+  //const int g = blockIdx.y * blockDim.y + threadIdx.y;
+  //const int c = g * D + threadIdx.x;
+  const int c = threadIdx.x;
+  const int g = c / D;
   const int nc = blockIdx.x * C + c;
   const int ng = blockIdx.x * G + g;
-  a[nc] = rstds[ng] * weight[c];
-  b[nc] = -means[ng] * rstds[ng] * weight[c] + bias[c];
+  const at::acc_type<T, true> a_nc = rstds[ng] * weight[c];
+  a[nc] = a_nc;
+  b[nc] = -means[ng] * a_nc + bias[c];
 }
 
 template <typename T>
-void gn_nhwc_forward_kernel(
+void gn_nhwc_forward_kernel3(
     const torch::Tensor& X,
     const torch::Tensor& weight,
     const torch::Tensor& bias,
@@ -126,24 +132,17 @@ void gn_nhwc_forward_kernel(
   const int W = X.size(2);
   const int C = X.size(3);
   const int D = C / G;
-  int blockDimX, blockDimY, gridDimY;
-  if (THREADS_PER_BLOCK >= G) {
-    blockDimX = G;
-    blockDimY = THREADS_PER_BLOCK / G;
-    gridDimY = 1;
-  }
-  else {
-    blockDimX = THREADS_PER_BLOCK;
-    blockDimY = 1;
-    gridDimY = G / THREADS_PER_BLOCK;
-  }
-  const int HWd = H * W * D / blockDimY;
+  int blockDimX, blockDimY, gridDimY, gridDimZ;
+  blockDimX = C / 4;
+  blockDimY = THREADS_PER_BLOCK / blockDimX;
+  gridDimY = 1;
+  gridDimZ = 1;
 
-  dim3 dimGrid(N, gridDimY);
-  //const dim3 dimGrid(N);
+  dim3 dimGrid(N, gridDimY, gridDimZ);
   dim3 dimBlock(blockDimX, blockDimY);
-  compute_stats<T><<<dimGrid, dimBlock>>>(
-      X_data, G, HWd, eps,
+
+  compute_stats4<T><<<dimGrid, dimBlock>>>(
+      X_data, C, G, H*W*C, eps,
       mean_data, rstd_data
   );
 
@@ -167,7 +166,13 @@ void gn_nhwc_forward_kernel(
     blockDimY = 1;
     gridDimY = C / THREADS_PER_BLOCK;
   }
-  compute_scale_biases<<<dim3(N, gridDimY), dim3(blockDimX, blockDimY)>>>(
+
+  const int TPB = 128;
+  gridDimY = C / TPB;
+  gridDimY = gridDimY > 0 ? gridDimY : 1;
+  blockDimY = TPB >= D ? TPB / D : 1;
+  //compute_scale_biases3<<<dim3(N, gridDimY), dim3(D, blockDimY)>>>( // note: max(D, T) threads per block
+  compute_scale_biases3<<<N, C>>>( // note: max(D, T) threads per block
       mean_data, rstd_data,
       weight_data, bias_data,
       G, C,
@@ -176,21 +181,19 @@ void gn_nhwc_forward_kernel(
   at::TensorIterator iter = at::TensorIteratorConfig()
     .check_all_same_dtype(std::is_same<T, T_ACC>::value) // this line relaxes requirement that all inputs/outputs are same dtype if T isn't T_ACC 
     .resize_outputs(false)
-    .add_owned_output(Y.view({N, H * W, D, G}))
-    .add_owned_input(X.view({N, H * W, D, G}))
-    .add_owned_input(a.view({N, 1, D, G}))
-    .add_owned_input(b.view({N, 1, D, G}))
+    .add_owned_output(Y.view({N, H * W, G, D}))
+    .add_owned_input(X.view({N, H * W, G, D}))
+    .add_owned_input(a.view({N, 1, G, D}))
+    .add_owned_input(b.view({N, 1, G, D}))
     .build();
 
-  //at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T mean, T rstd, T weight, T bias) -> T {
   at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T_ACC a, T_ACC b) -> T {
-      //return (static_cast<T_ACC>(x) - static_cast<T_ACC>(mean)) * static_cast<T_ACC>(rstd) * static_cast<T_ACC>(weight) + static_cast<T_ACC>(bias);
       return static_cast<T_ACC>(x) * a + b;
       });
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
-std::vector<torch::Tensor> gn_nhwc_cuda_forward(
+std::vector<torch::Tensor> gn_nhwc_cuda_forward3(
     const torch::Tensor& X,
     const torch::Tensor& weight,
     const torch::Tensor& bias,
@@ -208,7 +211,7 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward(
     at::ScalarType::BFloat16,
     X.scalar_type(),
     "group_norm_nhwc_forward", [&]() {
-      gn_nhwc_forward_kernel<scalar_t>(
+      gn_nhwc_forward_kernel3<scalar_t>(
           X_nhwc,
           weight,
           bias,
