@@ -34,7 +34,7 @@ full_reduce(
 }
 template <typename T>
 __global__ void
-compute_stats3(
+compute_stats2(
         const T* X,
         const int D,
         const int G,
@@ -55,18 +55,19 @@ compute_stats3(
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
 
   const int HWC = HWd * THREADS_PER_BLOCK * G;
-#pragma unroll 8
-  for (int i = 0; i < HWd/4; ++i) {
-    int reduce_idx = i * THREADS_PER_BLOCK * G * 4 + threadIdx.y * D * G + blockIdx.y * D + threadIdx.x * 4; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
-    const float4 tmp = reinterpret_cast<const float4 *>(X + (blockIdx.x * HWC + reduce_idx))[0];
-    val = welford_op.reduce(val, static_cast<T_ACC>(tmp.x), reduce_idx); // last arg isn't used in src
-    val = welford_op.reduce(val, static_cast<T_ACC>(tmp.y), reduce_idx); // last arg isn't used in src
-    val = welford_op.reduce(val, static_cast<T_ACC>(tmp.z), reduce_idx); // last arg isn't used in src
-    val = welford_op.reduce(val, static_cast<T_ACC>(tmp.w), reduce_idx); // last arg isn't used in src
+//#pragma unroll 8
+  //for (int i = 0; i < HWd/4; ++i) {
+  for (int i = 0; i < HWd; ++i) {
+    //int reduce_idx = i * THREADS_PER_BLOCK * G * 4 + threadIdx.y * D * G + blockIdx.y * D + threadIdx.x * 4; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
+    //const float4 tmp = reinterpret_cast<const float4 *>(X + (blockIdx.x * HWC + reduce_idx))[0];
+    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.x), reduce_idx); // last arg isn't used in src
+    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.y), reduce_idx); // last arg isn't used in src
+    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.z), reduce_idx); // last arg isn't used in src
+    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.w), reduce_idx); // last arg isn't used in src
 
-    //int reduce_idx = i * THREADS_PER_BLOCK * G + threadIdx.y * D * G + blockIdx.y * D + threadIdx.x; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
-    //T x = X[blockIdx.x * HWC + reduce_idx];
-    //val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
+    int reduce_idx = i * THREADS_PER_BLOCK * G + threadIdx.y * D * G + blockIdx.y * D + threadIdx.x; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
+    T x = X[blockIdx.x * HWC + reduce_idx];
+    val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
   }
 
   full_reduce(val, welford_op, vals_reduced);
@@ -80,7 +81,7 @@ compute_stats3(
 
 template <typename T>
 __global__ void
-compute_scale_biases3(
+compute_scale_biases2(
         T* means,  // (N, G)
         T* rstds,  // (N, G)
         const T* weight, // (C)
@@ -125,7 +126,8 @@ void gn_nhwc_forward_kernel2(
   const int C = X.size(3);
   const int D = C / G;
   int blockDimX, blockDimY, gridDimY, gridDimZ;
-  blockDimX = D / 4;
+  //blockDimX = D / 4;
+  blockDimX = D;
   blockDimY = THREADS_PER_BLOCK / blockDimX;
   gridDimY = G;
   gridDimZ = 1;
@@ -134,7 +136,7 @@ void gn_nhwc_forward_kernel2(
   dim3 dimBlock(blockDimX, blockDimY);
 
   const int HWd = H * W * D / THREADS_PER_BLOCK;
-  compute_stats3<T><<<dimGrid, dimBlock>>>(
+  compute_stats2<T><<<dimGrid, dimBlock>>>(
       X_data, D, G, HWd, eps,
       mean_data, rstd_data
   );
@@ -164,8 +166,8 @@ void gn_nhwc_forward_kernel2(
   gridDimY = C / TPB;
   gridDimY = gridDimY > 0 ? gridDimY : 1;
   blockDimY = TPB >= D ? TPB / D : 1;
-  //compute_scale_biases3<<<dim3(N, gridDimY), dim3(D, blockDimY)>>>( // note: max(D, T) threads per block
-  compute_scale_biases3<<<N, C>>>( // note: max(D, T) threads per block
+  //compute_scale_biases2<<<dim3(N, gridDimY), dim3(D, blockDimY)>>>( // note: max(D, T) threads per block
+  compute_scale_biases2<<<N, C>>>( // note: max(D, T) threads per block
       mean_data, rstd_data,
       weight_data, bias_data,
       G, C,

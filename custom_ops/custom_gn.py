@@ -55,7 +55,12 @@ class GN_NHWCRef(nn.GroupNorm):
 class GN_NHWC_Func(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
-        X_out, means, rstds = gn_op.forward(X, weight, bias, G, eps)
+        #X_out, means, rstds = gn_op.forward(X, weight, bias, G, eps)
+        #if X.shape[0] <= 4 and weight.shape[0] / G >= 4:
+        if X.shape[0] <= 4:
+            X_out, means, rstds = gn_op.forward2(X, weight, bias, G, eps)
+        else:
+            X_out, means, rstds = gn_op.forward3(X, weight, bias, G, eps)
         ctx.save_for_backward(X, weight, means, rstds, torch.Tensor([G]))
         return X_out
 
@@ -128,7 +133,8 @@ if __name__ == '__main__':
         #torch.random.manual_seed(0)
 
         x = torch.randn((2, C, 4, 4), dtype=DTYPE).cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last) #* 100
-        gn1 = GN_NHWCRef(4, C).cuda().to(DTYPE)
+        #gn1 = GN_NHWCRef(4, C).cuda().to(DTYPE)
+        gn1 = nn.GroupNorm(4, C).cuda().to(DTYPE)
         gn2 = GN_NHWC(4, C).cuda().to(DTYPE)
 
         #x = torch.randn((2, C, 4, 4), dtype=DTYPE).cuda().requires_grad_(True) * 100
@@ -146,7 +152,7 @@ if __name__ == '__main__':
         g2 = gn2(x)
         print('FORWARD')
         print('g1', g1.shape)
-        print((g1-g2).reshape((g1.numel(),)))
+        print(g1-g2)
         print('BACKWARD')
         print('g1 sum wrt x')
         g1_grad_wrt_x = torch.autograd.grad(g1.sum(), x, retain_graph=True)[0] #.reshape((x.numel(),))
@@ -166,16 +172,38 @@ if __name__ == '__main__':
     if MODE != 'check':
         #for B, C, R, NTRIALS in [(4, 512, 8, 10000), (8, 256, 128, 1000)]:
         for B, C, R, NTRIALS in [
-                #(4, 64, 256, 1000),
-                #(4, 512, 8, 10000),
                 #(32, 64, 256, 100),
                 #(32, 256, 64, 1),
                 #(4, 256, 32, 1),
-                (32, 256, 64, 1000),
-                (1, 256, 32, 40000),
+                #(32, 256, 64, 1000),
+                #(1, 256, 32, 40000),
+                #(4, 256, 32, 10000),
+                #(32, 256, 32, 1000),
+
+                (1, 64, 256, 1000),
+                (1, 128, 128, 2000),
+                (1, 256, 64, 5000),
+                (1, 256, 32, 10000),
+                (1, 256, 16, 20000),
+                (1, 512, 8, 20000),
+                (4, 64, 256, 1000),
+                (4, 128, 128, 2000),
+                (4, 256, 64, 5000),
                 (4, 256, 32, 10000),
-                (32, 256, 32, 1000),
-                (32, 512, 8, 10000),
+                (4, 256, 16, 20000),
+                (4, 512, 8, 20000),
+                #(8, 64, 256, 500),
+                #(8, 128, 128, 1000),
+                #(8, 256, 64, 2000),
+                #(8, 256, 32, 5000),
+                #(8, 256, 16, 10000),
+                #(8, 512, 8, 10000),
+                #(32, 64, 256, 100),
+                #(32, 128, 128, 200),
+                #(32, 256, 64, 500),
+                #(32, 256, 32, 1000),
+                #(32, 256, 16, 4000),
+                #(32, 512, 8, 4000),
                 ]:
             #x_nchw = torch.randn((32, C, 128, 128), dtype=DTYPE, device='cuda').requires_grad_(True)
             x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda').requires_grad_(True)
@@ -185,10 +213,10 @@ if __name__ == '__main__':
             BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
             print(BENCH, x_nchw.shape)
             for gn_class, gn_input, desc, fwd_fn in (
-                    (GN_NHWC, x_nhwc, 'GN NHWC (custom op)', gn_op.forward3),
+                    (GN_NHWC, x_nhwc, 'GN NHWC3 (custom op)', gn_op.forward3),
                     (GN_NHWC, x_nhwc, 'GN NHWC2 (custom op)', gn_op.forward2),
-                    (GN_NHWC, x_nhwc, 'GN NHWC3 (custom op)', gn_op.forward),
-                    #(GN_NCHW, x_nchw, 'nn GN NCHW (from src)'),
+                    (GN_NHWC, x_nhwc, 'GN NHWC (custom op)', gn_op.forward),
+                    (GN_NCHW, x_nchw, 'nn GN NCHW (from src)', None),
                     #(nn.GroupNorm, x_nchw, 'nn GN NCHW'),
                     #(nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
                     #(GN_NHWCRef, x_nhwc, 'GN NHWC (reference)'),
