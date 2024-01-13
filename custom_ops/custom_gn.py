@@ -6,7 +6,6 @@ import time, os
 torch.set_printoptions(sci_mode=False)
 module_dir = os.path.dirname(os.path.abspath(__file__))
 
-print('Started loading module')
 from torch.utils.cpp_extension import load
 gn_op = load(
         name="gn_op",
@@ -19,9 +18,10 @@ gn_op = load(
             '--extended-lambda',
             '-use_fast_math',
             '-lineinfo'
-            ]
+            ],
+        extra_cflags=['-O3'], # needed or else GN NCHW from source is slower than nn.GroupNorm
+        verbose=True
         )
-print('Finished loading module')
 
 class GN_NHWCRefRef(nn.GroupNorm):
     def __init__(self, num_groups: int, nc: int, **kwargs):
@@ -160,7 +160,7 @@ if __name__ == '__main__':
         print(g1_grad_wrt_b - g2_grad_wrt_b)
 
     if MODE != 'check':
-        for B, C, R in ((32, 512, 8),):
+        for B, C, R in ((32, 256, 128),):
             #x_nchw = torch.randn((32, C, 128, 128), dtype=DTYPE, device='cuda').requires_grad_(True)
             x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda').requires_grad_(True)
             x_nhwc = x_nchw.contiguous(memory_format=torch.channels_last).cuda().requires_grad_(True)
@@ -169,7 +169,7 @@ if __name__ == '__main__':
             BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
             for gn_class, gn_input, desc in (
                     (GN_NHWC, x_nhwc, 'GN NHWC (custom op)'),
-                    (GN_NCHW, x_nchw, 'nn GN NCHW'),
+                    (GN_NCHW, x_nchw, 'nn GN NCHW (from src)'),
                     #(nn.GroupNorm, x_nchw, 'nn GN NCHW'),
                     #(nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
                     #(GN_NHWCRef, x_nhwc, 'GN NHWC (reference)'),
@@ -178,11 +178,14 @@ if __name__ == '__main__':
                     ):
                 print(desc, BENCH)
                 gn_layer = gn_class(*gn_args).cuda().to(DTYPE)
-                g = gn_layer(gn_input)
-                torch.cuda.synchronize()
-                for i in tqdm(range(5000)):
+                #g = gn_layer(gn_input)
+                #torch.cuda.synchronize()
+                for i in tqdm(range(1)):
                     if BENCH != 'bwd':
-                        g = gn_layer(gn_input)
+                        if isinstance(gn_layer, GN_NCHW):
+                            g = gn_op.nchwforward(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
+                        else:
+                            g = gn_layer(gn_input)
                     if BENCH != 'fwd':
                         if 'NHWC' in desc:
                             g_mem_fmt = g.contiguous(memory_format=torch.channels_last) # in NHWC models, must convert possibly NCHW outputs into NHWC (i.e. from nn GN), note that this is a no-op if g is already in NHWC format (e.g. GN_NHWC output)
