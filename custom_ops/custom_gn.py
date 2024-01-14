@@ -59,14 +59,11 @@ class GN_NHWC_Func(torch.autograd.Function):
         #if X.shape[0] <= 4 and weight.shape[0] / G >= 4:
         #if X.shape == (4, 64, 256, 256):
         #print(X.shape, G)
-        #if X.shape[0] <= 4 and X.shape[1] / G < 16 and X.shape[2] >= 32:
-        #    #print('4')
-        #    X_out, means, rstds = gn_op.forward4(X, weight, bias, G, eps)
-        if X.shape[0] <= 4:
-            #print('2')
+        if X.shape[0] <= 8 and X.shape[1] / G < 8 and weight.dtype in (torch.bfloat16, torch.half):
+            X_out, means, rstds = gn_op.forward4(X, weight, bias, G, eps)
+        elif X.shape[0] <= 8:
             X_out, means, rstds = gn_op.forward2(X, weight, bias, G, eps)
         else:
-            #print('3')
             X_out, means, rstds = gn_op.forward3(X, weight, bias, G, eps)
         ctx.save_for_backward(X, weight, means, rstds, torch.Tensor([G]))
         return X_out
@@ -132,7 +129,8 @@ if __name__ == '__main__':
     bf16: 
     '''
     C = 512
-    DTYPE = torch.float
+    DTYPE = torch.bfloat16
+    print('DTYPE:', DTYPE)
     MODE = 'bench' # can be 'check', 'bench', default does both
 
     if MODE != 'bench':
@@ -224,17 +222,26 @@ if __name__ == '__main__':
                 #(4, 64, 64, 1),
                 #(4, 64, 128, 1),
                 #(4, 64, 256, 1),
+                #(4, 256, 8, 1),
+                #(4, 256, 16, 1),
+                #(4, 256, 12, 1),
+                #(4, 256, 64, 1),
+                #(4, 256, 128, 1),
+                #(4, 256, 256, 1),
                 (4, 64, 8, 10000),
                 (4, 64, 16, 10000),
                 (4, 64, 32, 10000),
-                (4, 64, 64, 10000),
-                (4, 64, 128, 1000),
-                (4, 64, 256, 1000),
-                #(4, 128, 128, 0),
-                #(4, 256, 64, 0),
-                #(4, 256, 32, 0),
-                #(4, 256, 16, 0),
-                #(4, 512, 8, 0),
+                (4, 256, 8, 10000),
+                (4, 256, 16, 10000),
+                (4, 256, 32, 10000),
+                (4, 256, 64, 10000),
+                (4, 256, 128, 1000),
+                (4, 256, 256, 1000),
+                #(4, 128, 128, 1),
+                #(4, 256, 64, 1),
+                #(4, 256, 32, 1),
+                #(4, 256, 16, 1),
+                #(4, 512, 8, 1),
                 ]:
             #x_nchw = torch.randn((32, C, 128, 128), dtype=DTYPE, device='cuda').requires_grad_(True)
             x_nchw = torch.randn((B, C, R, R), dtype=DTYPE, device='cuda').requires_grad_(True)
@@ -248,7 +255,7 @@ if __name__ == '__main__':
                     (GN_NHWC, x_nhwc, 'GN NHWC3 (custom op)', gn_op.forward3),
                     (GN_NHWC, x_nhwc, 'GN NHWC2 (custom op)', gn_op.forward2),
                     #(GN_NHWC, x_nhwc, 'GN NHWC (custom op)', gn_op.forward),
-                    (GN_NCHW, x_nchw, 'nn GN NCHW (from src)', None),
+                    #(GN_NCHW, x_nchw, 'nn GN NCHW (from src)', None),
                     #(nn.GroupNorm, x_nchw, 'nn GN NCHW'),
                     #(nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
                     #(GN_NHWCRef, x_nhwc, 'GN NHWC (reference)'),

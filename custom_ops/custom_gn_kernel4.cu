@@ -12,7 +12,7 @@
 #include <thrust/pair.h>
 #include <cuda.h>
 #include <vector>
-#define THREADS_PER_BLOCK 128 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
+#define THREADS_PER_BLOCK 128 // low threads per block bad because less occupancy, high threads per block bad because of smaller reduction loops -> more instruction overhead
 
 template <typename T>
 __global__ void
@@ -60,36 +60,6 @@ compute_stats4(
       vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
     __syncthreads();
     }
-
-  // (c,g,D) -> (g,c,D) -> (g,) (where g * D = num_elems_coalesced)
-  /*const int g = num_elems_coalesced / D; // number of groups this thread block is processing
-  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  const int c_idx = threadIdx.y;
-  const int g_idx = threadIdx.x / D;
-  const int d = threadIdx.x % D;
-  vals_reduced[g_idx * blockDim.y * D + c_idx * D + d] = val;
-  __syncthreads();
-
-  for (int stride = blockDim.y * D / 2; stride >= 1; stride >>= 1) {
-    if ((tid % g) < stride)
-      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
-    __syncthreads();
-    }*/
-
-  // (c,g,D) -> (g,D,c) -> (g,) (where g * D = num_elems_coalesced)
-  /*const int g = num_elems_coalesced / D; // number of groups this thread block is processing
-  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
-  const int c_idx = threadIdx.y;
-  const int g_idx = threadIdx.x / D;
-  const int d = threadIdx.x % D;
-  vals_reduced[g_idx * blockDim.y * D + c_idx * D + d] = val;
-  __syncthreads();
-
-  for (int stride = D * blockDim.y / 2; stride >= 1; stride >>= 1) {
-    if ((tid % g) < stride)
-      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
-    __syncthreads();
-    }*/
 
   // put reduced outputs into return buffers
   if ((int)threadIdx.x < g && threadIdx.y == 0) {
@@ -147,11 +117,10 @@ void gn_nhwc_forward_kernel4(
   const int W = X.size(2);
   const int C = X.size(3);
   const int D = C / G;
-  const int num_elems_coalesced = 32 / sizeof(T); // determines number of numbers fit in a 32B coalesced read (e.g. 8 floats can fit in 32 bytes)
+  const int num_elems_coalesced = 8; // reads 8 floats consecutively, will still cause uncoalesced reads for bf16 (2 bytes/float * 8 floats -> 16 bytes, 16 bytes < 32 bytes/coalesced read) but happens to work better than reading 16 floats because of larger grid size
   int blockDimX, blockDimY, gridDimY, gridDimZ;
   blockDimX = num_elems_coalesced;
   blockDimY = THREADS_PER_BLOCK / blockDimX;
-  //gridDimY = G;
   gridDimY = C / blockDimX;
   gridDimZ = 1;
 
