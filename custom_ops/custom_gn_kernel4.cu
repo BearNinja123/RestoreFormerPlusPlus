@@ -12,15 +12,16 @@
 #include <thrust/pair.h>
 #include <cuda.h>
 #include <vector>
-#define THREADS_PER_BLOCK 512 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
+#define THREADS_PER_BLOCK 128 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
 
 template <typename T>
 __global__ void
-compute_stats3(
+compute_stats4(
         const T* X,
-        const int C,
+        const int D,
         const int G,
         const int HWC,
+        const int num_elems_coalesced,
         const float eps,
         T* means,
         T* rstds
@@ -28,7 +29,7 @@ compute_stats3(
   using T_ACC = at::acc_type<T, true>;
   using WelfordType = at::native::WelfordData<T_ACC, int>;
   using WelfordOp = at::native::WelfordOps<T_ACC, T_ACC, int, thrust::pair<T_ACC, T_ACC>>;
-  // griddim = N, G, blockdim = d, D
+  // griddim = N, G/g, blockdim = num_elems_coalesced (gD), c
 
   WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
   WelfordType val(0, 0, 0, 0);
@@ -36,51 +37,73 @@ compute_stats3(
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[THREADS_PER_BLOCK];
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
 
-  const int HWc = HWC / THREADS_PER_BLOCK;
+  const int HWd = HWC / gridDim.y / THREADS_PER_BLOCK;
 #pragma unroll 8
-  //for (int i = 0; i < HWc/4; ++i) {
-  for (int i = 0; i < HWc; ++i) {
-    //int reduce_idx = i * THREADS_PER_BLOCK * 4 + threadIdx.y * C + threadIdx.x * 4; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
-    //const float4 tmp = reinterpret_cast<const float4 *>(X + (blockIdx.x * HWC + reduce_idx))[0];
-    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.x), reduce_idx); // last arg isn't used in src
-    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.y), reduce_idx); // last arg isn't used in src
-    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.z), reduce_idx); // last arg isn't used in src
-    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.w), reduce_idx); // last arg isn't used in src
-
-    int reduce_idx = i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
+  for (int i = 0; i < HWd; ++i) {
+    int reduce_idx = i * blockDim.y * D * G + threadIdx.y * D * G + blockIdx.y * num_elems_coalesced + threadIdx.x; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
     T x = X[blockIdx.x * HWC + reduce_idx];
     val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
   }
 
-  const int D = C / G;
-
-  // suppose vals_reduced shape is (c, G, D), we need (G,) output
-  // (c,G,D) -> (D,c,G) -> (G,)
+  // suppose vals_reduced shape is (c, g, D), we need (g,) output
+  // (c,g,D) -> (D,c,g) -> (g,) (where g * D = num_elems_coalesced)
+  const int g = num_elems_coalesced / D; // number of groups this thread block is processing
   int tid = threadIdx.y * blockDim.x + threadIdx.x;
   const int c_idx = threadIdx.y;
-  const int g = threadIdx.x / D;
+  const int g_idx = threadIdx.x / D;
   const int d = threadIdx.x % D;
-  vals_reduced[d * blockDim.y * G + c_idx * G + g] = val;
+  vals_reduced[d * blockDim.y * g + c_idx * g + g_idx] = val;
   __syncthreads();
 
-  for (int stride = THREADS_PER_BLOCK / 2; stride >= G; stride >>= 1) {
+  for (int stride = THREADS_PER_BLOCK / 2; stride >= g; stride >>= 1) {
     if (tid < stride)
       vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
     __syncthreads();
     }
 
+  // (c,g,D) -> (g,c,D) -> (g,) (where g * D = num_elems_coalesced)
+  /*const int g = num_elems_coalesced / D; // number of groups this thread block is processing
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+  const int c_idx = threadIdx.y;
+  const int g_idx = threadIdx.x / D;
+  const int d = threadIdx.x % D;
+  vals_reduced[g_idx * blockDim.y * D + c_idx * D + d] = val;
+  __syncthreads();
+
+  for (int stride = blockDim.y * D / 2; stride >= 1; stride >>= 1) {
+    if ((tid % g) < stride)
+      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
+    __syncthreads();
+    }*/
+
+  // (c,g,D) -> (g,D,c) -> (g,) (where g * D = num_elems_coalesced)
+  /*const int g = num_elems_coalesced / D; // number of groups this thread block is processing
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+  const int c_idx = threadIdx.y;
+  const int g_idx = threadIdx.x / D;
+  const int d = threadIdx.x % D;
+  vals_reduced[g_idx * blockDim.y * D + c_idx * D + d] = val;
+  __syncthreads();
+
+  for (int stride = D * blockDim.y / 2; stride >= 1; stride >>= 1) {
+    if ((tid % g) < stride)
+      vals_reduced[tid] = welford_op.combine(vals_reduced[tid], vals_reduced[tid + stride]);
+    __syncthreads();
+    }*/
+
   // put reduced outputs into return buffers
-  if ((int)threadIdx.x < G && threadIdx.y == 0) {
+  if ((int)threadIdx.x < g && threadIdx.y == 0) {
     T_ACC m1, m2;
     thrust::tie(m2, m1) = welford_op.project(vals_reduced[threadIdx.x]);
-    means[blockIdx.x * G + threadIdx.x] = m1;
-    rstds[blockIdx.x * G + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
+    //thrust::tie(m2, m1) = welford_op.project(vals_reduced[blockDim.y * D * threadIdx.x]);
+    means[blockIdx.x * G + blockIdx.y * g + threadIdx.x] = m1;
+    rstds[blockIdx.x * G + blockIdx.y * g + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
   }
 }
 
 template <typename T>
 __global__ void
-compute_scale_biases3(
+compute_scale_biases4(
         T* means,  // (N, G)
         T* rstds,  // (N, G)
         const T* weight, // (C)
@@ -103,7 +126,7 @@ compute_scale_biases3(
 }
 
 template <typename T>
-void gn_nhwc_forward_kernel3(
+void gn_nhwc_forward_kernel4(
     const torch::Tensor& X,
     const torch::Tensor& weight,
     const torch::Tensor& bias,
@@ -124,17 +147,20 @@ void gn_nhwc_forward_kernel3(
   const int W = X.size(2);
   const int C = X.size(3);
   const int D = C / G;
+  const int num_elems_coalesced = 32 / sizeof(T); // determines number of numbers fit in a 32B coalesced read (e.g. 8 floats can fit in 32 bytes)
   int blockDimX, blockDimY, gridDimY, gridDimZ;
-  blockDimX = C;
+  blockDimX = num_elems_coalesced;
   blockDimY = THREADS_PER_BLOCK / blockDimX;
-  gridDimY = 1;
+  //gridDimY = G;
+  gridDimY = C / blockDimX;
   gridDimZ = 1;
 
   dim3 dimGrid(N, gridDimY, gridDimZ);
   dim3 dimBlock(blockDimX, blockDimY);
 
-  compute_stats3<T><<<dimGrid, dimBlock>>>(
-      X_data, C, G, H*W*C, eps,
+  const int HWC = H * W * C;
+  compute_stats4<T><<<dimGrid, dimBlock>>>(
+      X_data, D, G, HWC, num_elems_coalesced, eps,
       mean_data, rstd_data
   );
 
@@ -147,19 +173,8 @@ void gn_nhwc_forward_kernel3(
   torch::Tensor b = torch::empty({N, C}, X.options().dtype(kAccType));
   T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
   T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
-  
-  if (THREADS_PER_BLOCK >= C) {
-    blockDimX = C;
-    blockDimY = THREADS_PER_BLOCK / C;
-    gridDimY = 1;
-  }
-  else {
-    blockDimX = THREADS_PER_BLOCK;
-    blockDimY = 1;
-    gridDimY = C / THREADS_PER_BLOCK;
-  }
 
-  compute_scale_biases3<<<N, C>>>( // note: max(D, T) threads per block
+  compute_scale_biases4<<<N, C>>>( // note: max(D, T) threads per block
       mean_data, rstd_data,
       weight_data, bias_data,
       G, C,
@@ -180,7 +195,7 @@ void gn_nhwc_forward_kernel3(
   AT_CUDA_CHECK(cudaGetLastError());
 }
 
-std::vector<torch::Tensor> gn_nhwc_cuda_forward3(
+std::vector<torch::Tensor> gn_nhwc_cuda_forward4(
     const torch::Tensor& X,
     const torch::Tensor& weight,
     const torch::Tensor& bias,
@@ -198,7 +213,7 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward3(
     at::ScalarType::BFloat16,
     X.scalar_type(),
     "group_norm_nhwc_forward", [&]() {
-      gn_nhwc_forward_kernel3<scalar_t>(
+      gn_nhwc_forward_kernel4<scalar_t>(
           X_nhwc,
           weight,
           bias,

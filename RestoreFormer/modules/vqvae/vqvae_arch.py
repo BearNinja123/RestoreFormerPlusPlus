@@ -77,7 +77,7 @@ class VectorQuantizer(nn.Module):
 nonlinearity = F.silu
 #nonlinearity = lambda x: x
 
-NORM = 'SFAST GN'
+NORM = 'GN'
 
 class BN_Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
     def __init__(self, in_channels: int, num_groups: int = 32):
