@@ -1,8 +1,8 @@
 #include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
 #include <c10/cuda/CUDAMathCompat.h> // rsqrt
 #include <ATen/AccumulateType.h> // acc_type
-#include "scale_shift_kernel.h" // scale_shift
 #include <thrust/pair.h> // thrust::pair
+#include <torch/torch.h> // torch tensor
 #include <vector> // std::vector
 #define THREADS_PER_BLOCK 128 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
 
@@ -26,12 +26,16 @@ full_reduce(
 }
 template <typename T>
 __global__ void
-compute_stats2(
+fused_kernel(
         const T* X,
-        const int D,
+        const T* weight,
+        const T* bias,
+        const int H,
+        const int W,
+        const int C,
         const int G,
-        const int HWd,
         const float eps,
+        T* Y,
         T* means,
         T* rstds
   ) {
@@ -43,14 +47,20 @@ compute_stats2(
   WelfordOp welford_op = {/*correction=*/0, /*take_sqrt=*/false};
   WelfordType val(0, 0, 0, 0);
 
+  const int D = C / G;
+  //extern __shared__ char X_tmp[];
+  extern __shared__ float* X_tmp[];
+  T *X_shmem = reinterpret_cast<T*>(X_tmp);
   __shared__ typename std::aligned_storage<sizeof(WelfordType), alignof(WelfordType)>::type vals_reduced_arr[THREADS_PER_BLOCK];
   WelfordType *vals_reduced = reinterpret_cast<WelfordType*>(vals_reduced_arr);
 
-  const int HWC = HWd * THREADS_PER_BLOCK * G;
+  const int HWC = H * W * C;
+  const int HWd = H * W * D / THREADS_PER_BLOCK;
 #pragma unroll 8
   for (int i = 0; i < HWd; ++i) {
     int reduce_idx = i * THREADS_PER_BLOCK * G + threadIdx.y * D * G + blockIdx.y * D + threadIdx.x; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
     T x = X[blockIdx.x * HWC + reduce_idx];
+    X_shmem[i * blockDim.y * D + threadIdx.y * D + threadIdx.x] = x;
     val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
   }
 
@@ -61,10 +71,24 @@ compute_stats2(
     means[blockIdx.x * G + blockIdx.y] = m1;
     rstds[blockIdx.x * G + blockIdx.y] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
   }
+
+  const int ng = blockIdx.x * G + blockIdx.y;
+  const int c = blockIdx.y * D + threadIdx.x;
+#pragma unroll 8
+  for (int i = 0; i < HWd; ++i) {
+    int reduce_idx = i * THREADS_PER_BLOCK * G + threadIdx.y * D * G + blockIdx.y * D + threadIdx.x; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
+    int X_idx = blockIdx.x * HWC + reduce_idx;
+    T_ACC x = static_cast<T_ACC>(X_shmem[i * blockDim.y * D + threadIdx.y * D + threadIdx.x]);
+    T mean = means[ng];
+    T rstd = rstds[ng];
+    T w = weight[c];
+    T b = bias[c];
+    Y[X_idx] = (x - mean) * rstd * w + b;
+  }
 }
 
 template <typename T>
-void gn_nhwc_forward_kernel2(
+void gn_nhwc_forward_kernel_fused(
     const torch::Tensor& X,
     const torch::Tensor& weight,
     const torch::Tensor& bias,
@@ -76,6 +100,9 @@ void gn_nhwc_forward_kernel2(
   const T* X_data = X.const_data_ptr<T>();
   T* mean_data = means.mutable_data_ptr<T>();
   T* rstd_data = rstds.mutable_data_ptr<T>();
+  T* weight_data = weight.mutable_data_ptr<T>();
+  T* bias_data = bias.mutable_data_ptr<T>();
+  T* Y_data = Y.mutable_data_ptr<T>();
 
   const int N = X.size(0);
   const int H = X.size(1);
@@ -91,17 +118,15 @@ void gn_nhwc_forward_kernel2(
   dim3 dimGrid(N, gridDimY, gridDimZ);
   dim3 dimBlock(blockDimX, blockDimY);
 
-  const int HWd = H * W * D / THREADS_PER_BLOCK;
-  compute_stats2<T><<<dimGrid, dimBlock>>>(
-      X_data, D, G, HWd, eps,
-      mean_data, rstd_data
+  fused_kernel<T><<<dimGrid, dimBlock, sizeof(T) * H * W * D>>>(
+      X_data, weight_data, bias_data,
+      H, W, C, G, eps,
+      Y_data, mean_data, rstd_data
   );
-
-  scale_shift<T>(X, weight, bias, G, Y, means, rstds);
-  AT_CUDA_CHECK(cudaGetLastError());
+  //AT_CUDA_CHECK(cudaGetLastError());
 }
 
-std::vector<torch::Tensor> gn_nhwc_cuda_forward2(
+std::vector<torch::Tensor> gn_nhwc_cuda_forward_fused(
     const torch::Tensor& X,
     const torch::Tensor& weight,
     const torch::Tensor& bias,
@@ -119,7 +144,7 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward2(
     at::ScalarType::BFloat16,
     X.scalar_type(),
     "group_norm_nhwc_forward", [&]() {
-      gn_nhwc_forward_kernel2<scalar_t>(
+      gn_nhwc_forward_kernel_fused<scalar_t>(
           X_nhwc,
           weight,
           bias,

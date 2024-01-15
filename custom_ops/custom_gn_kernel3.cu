@@ -1,18 +1,20 @@
 #include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
-#include <ATen/native/cuda/Loops.cuh>
-#include <c10/core/Device.h>
-#include <c10/core/DeviceType.h>
-#include <c10/core/ScalarType.h>
 #include <c10/cuda/CUDAMathCompat.h> // rsqrt
 #include <ATen/AccumulateType.h> // acc_type
-#include <ATen/ATen.h>
-#include <string>
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-#include <thrust/pair.h>
-#include <cuda.h>
-#include <vector>
+#include "scale_shift_kernel.h" // scale_shift
+#include <thrust/pair.h> // thrust::pair
+#include <vector> // std::vector
 #define THREADS_PER_BLOCK 512 // 512 slightly faster (~3%) than 1024 because of higher theoretical occupancy -> higher mem throughput
+
+template <typename T>
+void scale_shift(
+    const torch::Tensor& X,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const int G,
+    torch::Tensor& Y,
+    torch::Tensor& means,
+    torch::Tensor& rstds);
 
 template <typename T>
 __global__ void
@@ -38,15 +40,7 @@ compute_stats3(
 
   const int HWc = HWC / THREADS_PER_BLOCK;
 #pragma unroll 8
-  //for (int i = 0; i < HWc/4; ++i) {
   for (int i = 0; i < HWc; ++i) {
-    //int reduce_idx = i * THREADS_PER_BLOCK * 4 + threadIdx.y * C + threadIdx.x * 4; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
-    //const float4 tmp = reinterpret_cast<const float4 *>(X + (blockIdx.x * HWC + reduce_idx))[0];
-    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.x), reduce_idx); // last arg isn't used in src
-    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.y), reduce_idx); // last arg isn't used in src
-    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.z), reduce_idx); // last arg isn't used in src
-    //val = welford_op.reduce(val, static_cast<T_ACC>(tmp.w), reduce_idx); // last arg isn't used in src
-
     int reduce_idx = i * THREADS_PER_BLOCK + threadIdx.y * C + threadIdx.x; // only works if THREADS_PER_BLOCK >= D but realistically this will happen all the time
     T x = X[blockIdx.x * HWC + reduce_idx];
     val = welford_op.reduce(val, static_cast<T_ACC>(x), reduce_idx); // last arg isn't used in src
@@ -79,30 +73,6 @@ compute_stats3(
 }
 
 template <typename T>
-__global__ void
-compute_scale_biases3(
-        T* means,  // (N, G)
-        T* rstds,  // (N, G)
-        const T* weight, // (C)
-        const T* bias,   // (C)
-        const int G,
-        const int C,
-        at::acc_type<T, true>* a,            // (N, C)
-        at::acc_type<T, true>* b             // (N, C)
-  ) {
-  const int D = C / G;
-  //const int g = blockIdx.y * blockDim.y + threadIdx.y;
-  //const int c = g * D + threadIdx.x;
-  const int c = threadIdx.x;
-  const int g = c / D;
-  const int nc = blockIdx.x * C + c;
-  const int ng = blockIdx.x * G + g;
-  const at::acc_type<T, true> a_nc = rstds[ng] * weight[c];
-  a[nc] = a_nc;
-  b[nc] = -means[ng] * a_nc + bias[c];
-}
-
-template <typename T>
 void gn_nhwc_forward_kernel3(
     const torch::Tensor& X,
     const torch::Tensor& weight,
@@ -112,18 +82,14 @@ void gn_nhwc_forward_kernel3(
     torch::Tensor& Y,
     torch::Tensor& means,
     torch::Tensor& rstds) {
-  using T_ACC = at::acc_type<T, true>;
   const T* X_data = X.const_data_ptr<T>();
   T* mean_data = means.mutable_data_ptr<T>();
   T* rstd_data = rstds.mutable_data_ptr<T>();
-  const T* weight_data = weight.const_data_ptr<T>();
-  const T* bias_data = bias.const_data_ptr<T>();
 
   const int N = X.size(0);
   const int H = X.size(1);
   const int W = X.size(2);
   const int C = X.size(3);
-  const int D = C / G;
   int blockDimX, blockDimY, gridDimY, gridDimZ;
   blockDimX = C;
   blockDimY = THREADS_PER_BLOCK / blockDimX;
@@ -138,45 +104,7 @@ void gn_nhwc_forward_kernel3(
       mean_data, rstd_data
   );
 
-  const at::ScalarType kAccType =
-      (X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16)
-      ? at::kFloat
-      : X.scalar_type();
-
-  torch::Tensor a = torch::empty({N, C}, X.options().dtype(kAccType));
-  torch::Tensor b = torch::empty({N, C}, X.options().dtype(kAccType));
-  T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
-  T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
-  
-  if (THREADS_PER_BLOCK >= C) {
-    blockDimX = C;
-    blockDimY = THREADS_PER_BLOCK / C;
-    gridDimY = 1;
-  }
-  else {
-    blockDimX = THREADS_PER_BLOCK;
-    blockDimY = 1;
-    gridDimY = C / THREADS_PER_BLOCK;
-  }
-
-  compute_scale_biases3<<<N, C>>>( // note: max(D, T) threads per block
-      mean_data, rstd_data,
-      weight_data, bias_data,
-      G, C,
-      a_data, b_data);
-
-  at::TensorIterator iter = at::TensorIteratorConfig()
-    .check_all_same_dtype(std::is_same<T, T_ACC>::value) // this line relaxes requirement that all inputs/outputs are same dtype if T isn't T_ACC 
-    .resize_outputs(false)
-    .add_owned_output(Y.view({N, H * W, G, D}))
-    .add_owned_input(X.view({N, H * W, G, D}))
-    .add_owned_input(a.view({N, 1, G, D}))
-    .add_owned_input(b.view({N, 1, G, D}))
-    .build();
-
-  at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T_ACC a, T_ACC b) -> T {
-      return static_cast<T_ACC>(x) * a + b;
-      });
+  scale_shift<T>(X, weight, bias, G, Y, means, rstds);
   AT_CUDA_CHECK(cudaGetLastError());
 }
 

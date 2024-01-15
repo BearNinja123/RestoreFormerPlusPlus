@@ -1,18 +1,20 @@
 #include <ATen/native/SharedReduceOps.h> // WelfordData/WelfordOps
-#include <ATen/native/cuda/Loops.cuh>
-#include <c10/core/Device.h>
-#include <c10/core/DeviceType.h>
-#include <c10/core/ScalarType.h>
 #include <c10/cuda/CUDAMathCompat.h> // rsqrt
 #include <ATen/AccumulateType.h> // acc_type
-#include <ATen/ATen.h>
-#include <string>
-#include <torch/extension.h>
-#include <cuda_runtime.h>
-#include <thrust/pair.h>
-#include <cuda.h>
-#include <vector>
+#include "scale_shift_kernel.h" // scale_shift
+#include <thrust/pair.h> // thrust::pair
+#include <vector> // std::vector
 #define THREADS_PER_BLOCK 128 // low threads per block bad because less occupancy, high threads per block bad because of smaller reduction loops -> more instruction overhead
+
+template <typename T>
+void scale_shift(
+    const torch::Tensor& X,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const int G,
+    torch::Tensor& Y,
+    torch::Tensor& means,
+    torch::Tensor& rstds);
 
 template <typename T>
 __global__ void
@@ -47,8 +49,8 @@ compute_stats4(
 
   // suppose vals_reduced shape is (c, g, D), we need (g,) output
   // (c,g,D) -> (D,c,g) -> (g,) (where g * D = num_elems_coalesced)
+  const int tid = threadIdx.y * blockDim.x + threadIdx.x;
   const int g = num_elems_coalesced / D; // number of groups this thread block is processing
-  int tid = threadIdx.y * blockDim.x + threadIdx.x;
   const int c_idx = threadIdx.y;
   const int g_idx = threadIdx.x / D;
   const int d = threadIdx.x % D;
@@ -65,34 +67,9 @@ compute_stats4(
   if ((int)threadIdx.x < g && threadIdx.y == 0) {
     T_ACC m1, m2;
     thrust::tie(m2, m1) = welford_op.project(vals_reduced[threadIdx.x]);
-    //thrust::tie(m2, m1) = welford_op.project(vals_reduced[blockDim.y * D * threadIdx.x]);
     means[blockIdx.x * G + blockIdx.y * g + threadIdx.x] = m1;
     rstds[blockIdx.x * G + blockIdx.y * g + threadIdx.x] = c10::cuda::compat::rsqrt(m2 + static_cast<T_ACC>(eps));
   }
-}
-
-template <typename T>
-__global__ void
-compute_scale_biases4(
-        T* means,  // (N, G)
-        T* rstds,  // (N, G)
-        const T* weight, // (C)
-        const T* bias,   // (C)
-        const int G,
-        const int C,
-        at::acc_type<T, true>* a,            // (N, C)
-        at::acc_type<T, true>* b             // (N, C)
-  ) {
-  const int D = C / G;
-  //const int g = blockIdx.y * blockDim.y + threadIdx.y;
-  //const int c = g * D + threadIdx.x;
-  const int c = threadIdx.x;
-  const int g = c / D;
-  const int nc = blockIdx.x * C + c;
-  const int ng = blockIdx.x * G + g;
-  const at::acc_type<T, true> a_nc = rstds[ng] * weight[c];
-  a[nc] = a_nc;
-  b[nc] = -means[ng] * a_nc + bias[c];
 }
 
 template <typename T>
@@ -105,12 +82,9 @@ void gn_nhwc_forward_kernel4(
     torch::Tensor& Y,
     torch::Tensor& means,
     torch::Tensor& rstds) {
-  using T_ACC = at::acc_type<T, true>;
   const T* X_data = X.const_data_ptr<T>();
   T* mean_data = means.mutable_data_ptr<T>();
   T* rstd_data = rstds.mutable_data_ptr<T>();
-  const T* weight_data = weight.const_data_ptr<T>();
-  const T* bias_data = bias.const_data_ptr<T>();
 
   const int N = X.size(0);
   const int H = X.size(1);
@@ -133,34 +107,7 @@ void gn_nhwc_forward_kernel4(
       mean_data, rstd_data
   );
 
-  const at::ScalarType kAccType =
-      (X.scalar_type() == at::kHalf || X.scalar_type() == at::kBFloat16)
-      ? at::kFloat
-      : X.scalar_type();
-
-  torch::Tensor a = torch::empty({N, C}, X.options().dtype(kAccType));
-  torch::Tensor b = torch::empty({N, C}, X.options().dtype(kAccType));
-  T_ACC* a_data = a.mutable_data_ptr<T_ACC>();
-  T_ACC* b_data = b.mutable_data_ptr<T_ACC>();
-
-  compute_scale_biases4<<<N, C>>>( // note: max(D, T) threads per block
-      mean_data, rstd_data,
-      weight_data, bias_data,
-      G, C,
-      a_data, b_data);
-
-  at::TensorIterator iter = at::TensorIteratorConfig()
-    .check_all_same_dtype(std::is_same<T, T_ACC>::value) // this line relaxes requirement that all inputs/outputs are same dtype if T isn't T_ACC 
-    .resize_outputs(false)
-    .add_owned_output(Y.view({N, H * W, G, D}))
-    .add_owned_input(X.view({N, H * W, G, D}))
-    .add_owned_input(a.view({N, 1, G, D}))
-    .add_owned_input(b.view({N, 1, G, D}))
-    .build();
-
-  at::native::gpu_kernel(iter, [] GPU_LAMBDA(T x, T_ACC a, T_ACC b) -> T {
-      return static_cast<T_ACC>(x) * a + b;
-      });
+  scale_shift<T>(X, weight, bias, G, Y, means, rstds);
   AT_CUDA_CHECK(cudaGetLastError());
 }
 

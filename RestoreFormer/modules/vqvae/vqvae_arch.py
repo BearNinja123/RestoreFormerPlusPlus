@@ -8,6 +8,7 @@ from custom_ops.custom_gn import GN_NHWC
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True) # apparently this is as fast as flash attn but more flexible
+torch.backends.cudnn.benchmark = True
 
 class VectorQuantizer(nn.Module):
     """
@@ -74,8 +75,8 @@ class VectorQuantizer(nn.Module):
 
         return z_q
 
-nonlinearity = F.silu
-#nonlinearity = lambda x: x
+#nonlinearity = F.silu
+nonlinearity = lambda x: x
 
 NORM = 'GN'
 
