@@ -55,18 +55,30 @@ class GN_NHWCRef(nn.GroupNorm):
 
 class GN_NHWC_Func(torch.autograd.Function):
     @staticmethod
+    def choose_kernel(X: torch.Tensor, G: int):
+        if X.shape[0] <= 8 and X.shape[2] * X.shape[3] >= 128 * 128: # and weight.dtype in (torch.bfloat16, torch.half):
+            return gn_op.forward5
+        if X.shape[0] <= 8 and X.shape[1] / G < 8: # and weight.dtype in (torch.bfloat16, torch.half):
+            return gn_op.forward4
+        elif X.shape[0] <= 8:
+            return gn_op.forward2
+        else:
+            return gn_op.forward3
+
+    @staticmethod
     def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
-        #X_out, means, rstds = gn_op.forward5(X, weight, bias, G, eps)
+        fwd_fn = GN_NHWC_Func.choose_kernel(X, G)
+        X_out, means, rstds = fwd_fn(X, weight, bias, G, eps)
         #if X.shape[1] * X.shape[2] * X.shape[3] / G <= 2048: # fused kernels don't improve speed in general case - kernel can afford to be 2x slower if it still takes no time
         #    X_out, means, rstds = gn_op.forward_fused(X, weight, bias, G, eps)
-        if X.shape[0] <= 8 and X.shape[2] * X.shape[3] >= 128 * 128: # and weight.dtype in (torch.bfloat16, torch.half):
-            X_out, means, rstds = gn_op.forward5(X, weight, bias, G, eps)
-        if X.shape[0] <= 8 and X.shape[1] / G < 8: # and weight.dtype in (torch.bfloat16, torch.half):
-            X_out, means, rstds = gn_op.forward4(X, weight, bias, G, eps)
-        elif X.shape[0] <= 8:
-            X_out, means, rstds = gn_op.forward2(X, weight, bias, G, eps)
-        else:
-            X_out, means, rstds = gn_op.forward3(X, weight, bias, G, eps)
+        #if X.shape[0] <= 8 and X.shape[2] * X.shape[3] >= 128 * 128: # and weight.dtype in (torch.bfloat16, torch.half):
+        #    X_out, means, rstds = gn_op.forward5(X, weight, bias, G, eps)
+        #if X.shape[0] <= 8 and X.shape[1] / G < 8: # and weight.dtype in (torch.bfloat16, torch.half):
+        #    X_out, means, rstds = gn_op.forward4(X, weight, bias, G, eps)
+        #elif X.shape[0] <= 8:
+        #    X_out, means, rstds = gn_op.forward2(X, weight, bias, G, eps)
+        #else:
+        #    X_out, means, rstds = gn_op.forward3(X, weight, bias, G, eps)
         ctx.save_for_backward(X, weight, means, rstds, torch.Tensor([G]))
         return X_out
 
@@ -196,18 +208,18 @@ if __name__ == '__main__':
                 #(4, 256, 32, 10000),
                 #(32, 256, 32, 1000),
 
-                (1, 64, 256, 1000),
+                #(1, 64, 256, 10000),
                 #(1, 128, 128, 2000),
                 #(1, 256, 64, 5000),
                 #(1, 256, 32, 10000),
                 #(1, 256, 16, 20000),
                 #(1, 512, 8, 20000),
-                (4, 64, 256, 1000),
-                #(4, 128, 128, 2000),
-                #(4, 256, 64, 5000),
-                #(4, 256, 32, 10000),
-                #(4, 256, 16, 20000),
-                #(4, 512, 8, 20000),
+                (4, 64, 256, 2000),
+                (4, 128, 128, 2000),
+                (4, 256, 64, 5000),
+                (4, 256, 32, 10000),
+                (4, 256, 16, 20000),
+                (4, 512, 8, 20000),
                 #(8, 64, 256, 500),
                 #(8, 128, 128, 1000),
                 #(8, 256, 64, 2000),
@@ -270,12 +282,12 @@ if __name__ == '__main__':
             BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
             print(BENCH, x_nchw.shape)
             for gn_class, gn_input, desc, fwd_fn in (
-                    (GN_NHWC, x_nhwc, 'GN NHWC5 (custom op)', gn_op.forward5),
-                    (GN_NHWC, x_nhwc, 'GN NHWC4 (custom op)', gn_op.forward4),
-                    (GN_NHWC, x_nhwc, 'GN NHWC3 (custom op)', gn_op.forward3),
-                    (GN_NHWC, x_nhwc, 'GN NHWC2 (custom op)', gn_op.forward2),
+                    #(GN_NHWC, x_nhwc, 'GN NHWC5 (custom op)', gn_op.forward5),
+                    #(GN_NHWC, x_nhwc, 'GN NHWC4 (custom op)', gn_op.forward4),
+                    #(GN_NHWC, x_nhwc, 'GN NHWC3 (custom op)', gn_op.forward3),
+                    #(GN_NHWC, x_nhwc, 'GN NHWC2 (custom op)', gn_op.forward2),
                     #(GN_NHWC, x_nhwc, 'GN NHWC fused (custom op)', gn_op.forward_fused),
-                    #(GN_NHWC, x_nhwc, 'GN NHWC (custom op)', gn_op.forward),
+                    (GN_NHWC, x_nhwc, 'GN NHWC (custom op)', None),
                     (GN_NCHW, x_nchw, 'nn GN NCHW (from src)', None),
                     #(nn.GroupNorm, x_nchw, 'nn GN NCHW'),
                     #(nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
@@ -289,12 +301,17 @@ if __name__ == '__main__':
                 torch.cuda.synchronize()
                 for i in tqdm(range(NTRIALS)):
                     if BENCH != 'bwd':
-                        if isinstance(gn_layer, GN_NHWC):
-                            g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                        elif isinstance(gn_layer, GN_NCHW):
-                            g = gn_op.nchwforward(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                        else:
-                            g = gn_layer(gn_input)
+                        #if isinstance(gn_layer, GN_NHWC):
+                        #    g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
+                        #elif isinstance(gn_layer, GN_NCHW):
+                        #    g = gn_op.nchwforward(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
+                        #else:
+                        #if isinstance(gn_layer, GN_NHWC):
+                        #    g = GN_NHWC_Func.choose_kernel(gn_input, gn_layer.num_groups)(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
+                        #elif isinstance(gn_layer, GN_NCHW):
+                        #    g = gn_op.nchwforward(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
+                        #else:
+                        g = gn_layer(gn_input)
                     if BENCH != 'fwd':
                         if 'NHWC' in desc:
                             g_mem_fmt = g.contiguous(memory_format=torch.channels_last) # in NHWC models, must convert possibly NCHW outputs into NHWC (i.e. from nn GN), note that this is a no-op if g is already in NHWC format (e.g. GN_NHWC output)
