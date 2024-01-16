@@ -148,9 +148,9 @@ if __name__ == '__main__':
         #x = torch.arange(C).reshape((2, C, 1, 1)).float().cuda().requires_grad_(True)
         #x = torch.arange(2*C*8*8).reshape((2, C, 8, 8)).float().cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last) #* 100
         B = 2
-        C = 512
+        C = 1024
         R = 4
-        G = C // 4
+        G = C // 1024
         x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
         #torch.random.manual_seed(0)
 

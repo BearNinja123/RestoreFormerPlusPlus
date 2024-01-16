@@ -22,38 +22,40 @@ comp = lambda m: torch.compile(m,
 NWARMUP = 15
 NTRIAL = 50
 with ctx:
-    if COMPILE:
-        m = comp(m_)
-    else:
-        m = m_
-    for i in tqdm(range(NWARMUP), smoothing=1):
-        y = m(x)[0]
-        if BWD:
-            y.sum().backward()
-        torch.cuda.synchronize()
-    tic = time.time()
-    for i in tqdm(range(NTRIAL), smoothing=1):
-        y = m(x)[0]
-        if BWD:
-            y.sum().backward()
-        torch.cuda.synchronize()
-    print('nchw', time.time() - tic)
+    if 'NN' in NORM:
+        if COMPILE:
+            m = comp(m_)
+        else:
+            m = m_
+        for i in tqdm(range(NWARMUP), smoothing=1):
+            y = m(x)[0]
+            if BWD:
+                y.sum().backward()
+            torch.cuda.synchronize()
+        tic = time.time()
+        for i in tqdm(range(NTRIAL), smoothing=1):
+            y = m(x)[0]
+            if BWD:
+                y.sum().backward()
+            torch.cuda.synchronize()
+        print('nchw', time.time() - tic)
 
-    m = m.to(memory_format=torch.channels_last)
-    x = x.to(memory_format=torch.channels_last)
-    if COMPILE:
-        m = comp(m)
     else:
-        m = m
-    for i in tqdm(range(NWARMUP), smoothing=1):
-        y = m(x)[0]
-        if BWD:
-            y.sum().backward()
-        torch.cuda.synchronize()
-    tic = time.time()
-    for i in tqdm(range(NTRIAL), smoothing=1):
-        y = m(x)[0]
-        if BWD:
-            y.sum().backward()
-        torch.cuda.synchronize()
-    print('nhwc', time.time() - tic)
+        m = m_.to(memory_format=torch.channels_last)
+        x = x.to(memory_format=torch.channels_last)
+        if COMPILE:
+            m = comp(m)
+        else:
+            m = m
+        for i in tqdm(range(NWARMUP), smoothing=1):
+            y = m(x)[0]
+            if BWD:
+                y.sum().backward()
+            torch.cuda.synchronize()
+        tic = time.time()
+        for i in tqdm(range(NTRIAL), smoothing=1):
+            y = m(x)[0]
+            if BWD:
+                y.sum().backward()
+            torch.cuda.synchronize()
+        print('nhwc', time.time() - tic)

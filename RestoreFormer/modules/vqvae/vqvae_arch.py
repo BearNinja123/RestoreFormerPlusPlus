@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from custom_ops.custom_gn import GN_NHWC
+from custom_ops.custom_gn import GN_NHWC, GN_NCHW
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True) # apparently this is as fast as flash attn but more flexible
@@ -75,10 +75,10 @@ class VectorQuantizer(nn.Module):
 
         return z_q
 
-#nonlinearity = F.silu
-nonlinearity = lambda x: x
+nonlinearity = F.silu
+#nonlinearity = lambda x: x
 
-NORM = 'GN'
+NORM = 'GN NN'
 
 class BN_Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
     def __init__(self, in_channels: int, num_groups: int = 32):
