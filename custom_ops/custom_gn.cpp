@@ -49,6 +49,13 @@ std::vector<torch::Tensor> gn_nhwc_cuda_forward4(
     const int G,
     float eps);
 
+std::vector<torch::Tensor> gn_nhwc_cuda_forward5(
+    const torch::Tensor& X,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    const int G,
+    float eps);
+
 std::vector<torch::Tensor> gn_nhwc_cuda_backward(
     const torch::Tensor& dy,
     const torch::Tensor& X,
@@ -111,6 +118,18 @@ std::vector<torch::Tensor> gn_nhwc_forward_fused(
   CHECK_CUDA(weight);
   CHECK_CUDA(bias);
   return gn_nhwc_cuda_forward_fused(X, weight, bias, G, eps);
+}
+
+std::vector<torch::Tensor> gn_nhwc_forward5(
+    const torch::Tensor X,
+    const torch::Tensor weight,
+    const torch::Tensor bias,
+    const int G,
+    float eps) {
+  CHECK_CUDA(X);
+  CHECK_CUDA(weight);
+  CHECK_CUDA(bias);
+  return gn_nhwc_cuda_forward5(X, weight, bias, G, eps);
 }
 
 std::vector<torch::Tensor> gn_nhwc_backward(
@@ -187,6 +206,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("forward2", &gn_nhwc_forward2, "GN NHWC forward2");
   m.def("forward3", &gn_nhwc_forward3, "GN NHWC forward3");
   m.def("forward4", &gn_nhwc_forward4, "GN NHWC forward4");
+  m.def("forward5", &gn_nhwc_forward5, "GN NHWC forward5");
   m.def("forward_fused", &gn_nhwc_forward_fused, "GN NHWC forward_fused");
   m.def("backward", &gn_nhwc_backward, "GN NHWC backward");
   m.def("nchwforward", &gn_nchw_forward, "GN NCHW forward");

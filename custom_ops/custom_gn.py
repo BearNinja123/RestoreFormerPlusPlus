@@ -15,6 +15,7 @@ gn_op = load(
             os.path.join(module_dir, "custom_gn_kernel2.cu"),
             os.path.join(module_dir, "custom_gn_kernel3.cu"),
             os.path.join(module_dir, "custom_gn_kernel4.cu"),
+            os.path.join(module_dir, "custom_gn_kernel5.cu"),
             os.path.join(module_dir, "fully_fused_gn_kernel.cu"),
             os.path.join(module_dir, "nchw_kernel.cu")
             ],
@@ -26,7 +27,6 @@ gn_op = load(
         extra_cflags=['-O3'], # needed or else GN NCHW from source is slower than nn.GroupNorm
         verbose=True
         )
-print(dir(gn_op))
 
 class GN_NHWCRefRef(nn.GroupNorm):
     def __init__(self, num_groups: int, nc: int, **kwargs):
@@ -56,10 +56,12 @@ class GN_NHWCRef(nn.GroupNorm):
 class GN_NHWC_Func(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
-        #X_out, means, rstds = gn_op.forward_fused(X, weight, bias, G, eps)
-        #if X.shape[1] * X.shape[2] * X.shape[3] / G <= 2048:
+        #X_out, means, rstds = gn_op.forward5(X, weight, bias, G, eps)
+        #if X.shape[1] * X.shape[2] * X.shape[3] / G <= 2048: # fused kernels don't improve speed in general case - kernel can afford to be 2x slower if it still takes no time
         #    X_out, means, rstds = gn_op.forward_fused(X, weight, bias, G, eps)
-        if X.shape[0] <= 8 and X.shape[1] / G < 8 and weight.dtype in (torch.bfloat16, torch.half):
+        if X.shape[0] <= 8 and X.shape[2] * X.shape[3] >= 128 * 128: # and weight.dtype in (torch.bfloat16, torch.half):
+            X_out, means, rstds = gn_op.forward5(X, weight, bias, G, eps)
+        if X.shape[0] <= 8 and X.shape[1] / G < 8: # and weight.dtype in (torch.bfloat16, torch.half):
             X_out, means, rstds = gn_op.forward4(X, weight, bias, G, eps)
         elif X.shape[0] <= 8:
             X_out, means, rstds = gn_op.forward2(X, weight, bias, G, eps)
@@ -128,14 +130,15 @@ if __name__ == '__main__':
     fp16: 
     bf16: 
     '''
-    C = 32
+    C = 64
     DTYPE = torch.bfloat16
     print('DTYPE:', DTYPE)
     MODE = 'bench' # can be 'check', 'bench', default does both
 
     if MODE != 'bench':
-        #x = torch.arange(C).reshape((1, C, 1, 1)).float().cuda().requires_grad_(True)
-        x = torch.arange(2*C*8*8).reshape((2, C, 8, 8)).float().cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last) #* 100
+        #x = torch.arange(C).reshape((2, C, 1, 1)).float().cuda().requires_grad_(True)
+        #x = torch.arange(2*C*8*8).reshape((2, C, 8, 8)).float().cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last) #* 100
+        x = torch.arange(2*C*256*256).reshape((2, C, 256, 256)).float().cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last) #* 100
         #torch.random.manual_seed(0)
 
         #x = torch.randn((2, C, 8, 8), dtype=DTYPE).cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last) * 100
@@ -143,8 +146,8 @@ if __name__ == '__main__':
         #gn1 = GN_NHWCRef(4, C).cuda().to(DTYPE)
         #gn1 = nn.GroupNorm(4, C).cuda().to(DTYPE)
         #gn2 = GN_NHWC(4, C).cuda().to(DTYPE)
-        gn1 = nn.GroupNorm(C//8, C).cuda().to(DTYPE)
-        gn2 = GN_NHWC(C//8, C).cuda().to(DTYPE)
+        gn1 = nn.GroupNorm(C//2, C).cuda().to(DTYPE)
+        gn2 = GN_NHWC(C//2, C).cuda().to(DTYPE)
 
         #x = torch.randn((2, C, 4, 4), dtype=DTYPE).cuda().requires_grad_(True) * 100
         #gn1 = nn.GroupNorm(4, C).cuda().to(DTYPE)
@@ -193,13 +196,13 @@ if __name__ == '__main__':
                 #(4, 256, 32, 10000),
                 #(32, 256, 32, 1000),
 
-                #(1, 64, 256, 1000),
+                (1, 64, 256, 1000),
                 #(1, 128, 128, 2000),
                 #(1, 256, 64, 5000),
                 #(1, 256, 32, 10000),
                 #(1, 256, 16, 20000),
                 #(1, 512, 8, 20000),
-                #(4, 64, 256, 1000),
+                (4, 64, 256, 1000),
                 #(4, 128, 128, 2000),
                 #(4, 256, 64, 5000),
                 #(4, 256, 32, 10000),
@@ -224,10 +227,10 @@ if __name__ == '__main__':
                 #(4, 128, 64, 10000),
 
                 #(4, 256, 32, 10000),
-                (4, 256, 16, 10000),
-                (4, 256, 8, 10000),
-                (4, 512, 16, 10000),
-                (4, 512, 8, 10000),
+                #(4, 256, 16, 10000),
+                #(4, 256, 8, 10000),
+                #(4, 512, 16, 10000),
+                #(4, 512, 8, 10000),
 
                 #(4, 128, 64, 10000),
                 #(4, 256, 64, 10000),
@@ -267,10 +270,11 @@ if __name__ == '__main__':
             BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
             print(BENCH, x_nchw.shape)
             for gn_class, gn_input, desc, fwd_fn in (
-                    #(GN_NHWC, x_nhwc, 'GN NHWC4 (custom op)', gn_op.forward4),
+                    (GN_NHWC, x_nhwc, 'GN NHWC5 (custom op)', gn_op.forward5),
+                    (GN_NHWC, x_nhwc, 'GN NHWC4 (custom op)', gn_op.forward4),
                     (GN_NHWC, x_nhwc, 'GN NHWC3 (custom op)', gn_op.forward3),
                     (GN_NHWC, x_nhwc, 'GN NHWC2 (custom op)', gn_op.forward2),
-                    (GN_NHWC, x_nhwc, 'GN NHWC fused (custom op)', gn_op.forward_fused),
+                    #(GN_NHWC, x_nhwc, 'GN NHWC fused (custom op)', gn_op.forward_fused),
                     #(GN_NHWC, x_nhwc, 'GN NHWC (custom op)', gn_op.forward),
                     (GN_NCHW, x_nchw, 'nn GN NCHW (from src)', None),
                     #(nn.GroupNorm, x_nchw, 'nn GN NCHW'),
