@@ -93,8 +93,14 @@ class GN_NHWC(nn.GroupNorm):
 
     def forward(self, x):
         #print(x.shape, self.num_channels)
-        #if x[0].numel() % 512 != 0:
-        #    raise ValueError(f'X[0] has shape {x[0].shape} which is not a multiple of 512. This input is not supported.')
+        N, C, H, W = x.shape
+        f = max(1, C // 512)
+        bdx = min(G // f, 512)
+        d = 512 // bdx
+        if C // G > 512:
+            raise ValueError(f'C // G = {C // G} which is greater than 512. This input is not supported.')
+        if W % d != 0:
+            raise ValueError(f'X[0] has width {W} which is not a multiple of {d}. This input is not supported.')
         if self.affine:
             return GN_NHWC_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps)
         else:
@@ -140,7 +146,7 @@ if __name__ == '__main__':
     fp16: 
     bf16: 
     '''
-    DTYPE = torch.bfloat16
+    DTYPE = torch.float
     print('DTYPE:', DTYPE)
     MODE = 'check' # can be 'check', 'bench', default does both
 
@@ -149,8 +155,8 @@ if __name__ == '__main__':
         #x = torch.arange(2*C*8*8).reshape((2, C, 8, 8)).float().cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last) #* 100
         B = 2
         C = 1024
-        R = 4
-        G = C // 1024
+        R = 12
+        G = C // 8
         x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
         #torch.random.manual_seed(0)
 
