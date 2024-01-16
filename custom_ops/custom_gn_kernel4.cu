@@ -7,16 +7,6 @@
 #define THREADS_PER_BLOCK 128 // low threads per block bad because less occupancy, high threads per block bad because of smaller reduction loops -> more instruction overhead
 
 template <typename T>
-void scale_shift(
-    const torch::Tensor& X,
-    const torch::Tensor& weight,
-    const torch::Tensor& bias,
-    const int G,
-    torch::Tensor& Y,
-    torch::Tensor& means,
-    torch::Tensor& rstds);
-
-template <typename T>
 __global__ void
 compute_stats4(
         const T* X,

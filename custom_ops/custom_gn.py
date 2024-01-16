@@ -16,6 +16,7 @@ gn_op = load(
             os.path.join(module_dir, "custom_gn_kernel3.cu"),
             os.path.join(module_dir, "custom_gn_kernel4.cu"),
             os.path.join(module_dir, "custom_gn_kernel5.cu"),
+            os.path.join(module_dir, "NG_grid_gn_kernel.cu"),
             os.path.join(module_dir, "fully_fused_gn_kernel.cu"),
             os.path.join(module_dir, "nchw_kernel.cu")
             ],
@@ -56,14 +57,11 @@ class GN_NHWCRef(nn.GroupNorm):
 class GN_NHWC_Func(torch.autograd.Function):
     @staticmethod
     def choose_kernel(X: torch.Tensor, G: int):
-        if X.shape[0] <= 8 and X.shape[2] * X.shape[3] >= 128 * 128: # and weight.dtype in (torch.bfloat16, torch.half):
-            return gn_op.forward5
-        if X.shape[0] <= 8 and X.shape[1] / G < 8: # and weight.dtype in (torch.bfloat16, torch.half):
-            return gn_op.forward4
-        elif X.shape[0] <= 8:
-            return gn_op.forward2
-        else:
-            return gn_op.forward3
+        return gn_op.forward5
+        #if X.shape[0] <= 8: # and X.shape[2] * X.shape[3] >= 128 * 128: # and weight.dtype in (torch.bfloat16, torch.half):
+        #    return gn_op.forward5
+        #else:
+        #    return gn_op.forward3
 
     @staticmethod
     def forward(ctx, X: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, G: int, eps: float):
@@ -95,8 +93,8 @@ class GN_NHWC(nn.GroupNorm):
 
     def forward(self, x):
         #print(x.shape, self.num_channels)
-        if x[0].numel() % 512 != 0:
-            raise ValueError(f'X[0] has shape {x[0].shape} which is not a multiple of 512. This input is not supported.')
+        #if x[0].numel() % 512 != 0:
+        #    raise ValueError(f'X[0] has shape {x[0].shape} which is not a multiple of 512. This input is not supported.')
         if self.affine:
             return GN_NHWC_Func.apply(x, self.weight, self.bias, self.num_groups, self.eps)
         else:
@@ -142,15 +140,18 @@ if __name__ == '__main__':
     fp16: 
     bf16: 
     '''
-    C = 64
     DTYPE = torch.bfloat16
     print('DTYPE:', DTYPE)
-    MODE = 'bench' # can be 'check', 'bench', default does both
+    MODE = 'check' # can be 'check', 'bench', default does both
 
     if MODE != 'bench':
         #x = torch.arange(C).reshape((2, C, 1, 1)).float().cuda().requires_grad_(True)
         #x = torch.arange(2*C*8*8).reshape((2, C, 8, 8)).float().cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last) #* 100
-        x = torch.arange(2*C*256*256).reshape((2, C, 256, 256)).float().cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last) #* 100
+        B = 2
+        C = 512
+        R = 4
+        G = C // 4
+        x = torch.arange(B * C * R * R).reshape((B, C, R, R)).to(DTYPE, memory_format=torch.channels_last).cuda().requires_grad_(True) #* 100
         #torch.random.manual_seed(0)
 
         #x = torch.randn((2, C, 8, 8), dtype=DTYPE).cuda().requires_grad_(True).contiguous(memory_format=torch.channels_last) * 100
@@ -158,8 +159,8 @@ if __name__ == '__main__':
         #gn1 = GN_NHWCRef(4, C).cuda().to(DTYPE)
         #gn1 = nn.GroupNorm(4, C).cuda().to(DTYPE)
         #gn2 = GN_NHWC(4, C).cuda().to(DTYPE)
-        gn1 = nn.GroupNorm(C//2, C).cuda().to(DTYPE)
-        gn2 = GN_NHWC(C//2, C).cuda().to(DTYPE)
+        gn1 = nn.GroupNorm(G, C).cuda().to(DTYPE)
+        gn2 = GN_NHWC(G, C).cuda().to(DTYPE)
 
         #x = torch.randn((2, C, 4, 4), dtype=DTYPE).cuda().requires_grad_(True) * 100
         #gn1 = nn.GroupNorm(4, C).cuda().to(DTYPE)
@@ -214,12 +215,12 @@ if __name__ == '__main__':
                 #(1, 256, 32, 10000),
                 #(1, 256, 16, 20000),
                 #(1, 512, 8, 20000),
-                (4, 64, 256, 2000),
-                (4, 128, 128, 2000),
-                (4, 256, 64, 5000),
-                (4, 256, 32, 10000),
-                (4, 256, 16, 20000),
-                (4, 512, 8, 20000),
+                #(4, 64, 256, 2000),
+                #(4, 128, 128, 2000),
+                #(4, 256, 64, 5000),
+                #(4, 256, 32, 10000),
+                #(4, 256, 16, 20000),
+                #(4, 512, 8, 20000),
                 #(8, 64, 256, 500),
                 #(8, 128, 128, 1000),
                 #(8, 256, 64, 2000),
@@ -232,6 +233,9 @@ if __name__ == '__main__':
                 #(32, 256, 32, 1000),
                 #(32, 256, 16, 4000),
                 #(32, 512, 8, 4000),
+                (4, 256, 32, 1),
+                (4, 256, 16, 1),
+                (4, 512, 8, 1),
 
                 #(4, 64, 256, 1000),
                 #(4, 64, 128, 3000),
@@ -282,13 +286,14 @@ if __name__ == '__main__':
             BENCH = 'fwd' # can be 'fwd', 'bwd', anything else is fwd + bwd
             print(BENCH, x_nchw.shape)
             for gn_class, gn_input, desc, fwd_fn in (
-                    #(GN_NHWC, x_nhwc, 'GN NHWC5 (custom op)', gn_op.forward5),
+                    (GN_NHWC, x_nhwc, 'GN NHWC5 (custom op)', gn_op.forward5),
                     #(GN_NHWC, x_nhwc, 'GN NHWC4 (custom op)', gn_op.forward4),
-                    #(GN_NHWC, x_nhwc, 'GN NHWC3 (custom op)', gn_op.forward3),
+                    (GN_NHWC, x_nhwc, 'GN NHWC3 (custom op)', gn_op.forward3),
+                    (GN_NHWC, x_nhwc, 'GN NHWC NG grid (custom op)', gn_op.fwd_NG_grid),
                     #(GN_NHWC, x_nhwc, 'GN NHWC2 (custom op)', gn_op.forward2),
                     #(GN_NHWC, x_nhwc, 'GN NHWC fused (custom op)', gn_op.forward_fused),
-                    (GN_NHWC, x_nhwc, 'GN NHWC (custom op)', None),
-                    (GN_NCHW, x_nchw, 'nn GN NCHW (from src)', None),
+                    #(GN_NHWC, x_nhwc, 'GN NHWC (custom op)', None),
+                    #(GN_NCHW, x_nchw, 'nn GN NCHW (from src)', None),
                     #(nn.GroupNorm, x_nchw, 'nn GN NCHW'),
                     #(nn.GroupNorm, x_nhwc, 'nn GN NHWC'),
                     #(GN_NHWCRef, x_nhwc, 'GN NHWC (reference)'),
@@ -302,16 +307,13 @@ if __name__ == '__main__':
                 for i in tqdm(range(NTRIALS)):
                     if BENCH != 'bwd':
                         #if isinstance(gn_layer, GN_NHWC):
-                        #    g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                        #elif isinstance(gn_layer, GN_NCHW):
-                        #    g = gn_op.nchwforward(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                        #else:
-                        #if isinstance(gn_layer, GN_NHWC):
                         #    g = GN_NHWC_Func.choose_kernel(gn_input, gn_layer.num_groups)(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                        #elif isinstance(gn_layer, GN_NCHW):
-                        #    g = gn_op.nchwforward(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
-                        #else:
-                        g = gn_layer(gn_input)
+                        if isinstance(gn_layer, GN_NHWC):
+                            g = fwd_fn(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
+                        elif isinstance(gn_layer, GN_NCHW):
+                            g = gn_op.nchwforward(gn_input, gn_layer.weight, gn_layer.bias, gn_layer.num_groups, gn_layer.eps)
+                        else:
+                            g = gn_layer(gn_input)
                     if BENCH != 'fwd':
                         if 'NHWC' in desc:
                             g_mem_fmt = g.contiguous(memory_format=torch.channels_last) # in NHWC models, must convert possibly NCHW outputs into NHWC (i.e. from nn GN), note that this is a no-op if g is already in NHWC format (e.g. GN_NHWC output)
