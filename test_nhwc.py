@@ -5,11 +5,13 @@ import torch.nn as nn
 import torch
 import time
 
+print(NORM)
+torch.random.manual_seed(0)
+
 DTYPE = torch.bfloat16
 m_ = VQVAEGAN(attn_resolutions=[16], enable_mid=True).to('cuda', dtype=DTYPE)
 #print(sum(p.numel() for p in m_.parameters()))
-print(NORM)
-x = torch.rand((4, 3, 256, 256), device='cuda', dtype=DTYPE)
+x = torch.rand((8, 3, 256, 256), device='cuda', dtype=DTYPE)
 
 COMPILE = False
 BWD = False
