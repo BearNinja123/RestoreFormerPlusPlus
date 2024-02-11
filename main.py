@@ -270,7 +270,7 @@ class ImageLogger(Callback):
         for k in images:
             grid = torchvision.utils.make_grid(images[k], nrow=4)
             grids[f"{split}/{k}"] = wandb.Image(grid, )
-        pl_module.logger.experiment.log(grids)
+        pl_module.logger.experiment.log(grids, step=batch_idx)
 
     @rank_zero_only
     def log_local(self, save_dir, split, images,
@@ -318,7 +318,7 @@ class ImageLogger(Callback):
                            pl_module.global_step, pl_module.current_epoch, batch_idx)
 
             logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
-            logger_log_images(pl_module, images, pl_module.global_step, split)
+            logger_log_images(pl_module, images, pl_module.global_step - 1, split) # not sure why batch_idx = pl_module.global_step - 1 (and not batch_idx = pl_module.global_step) but it is
 
             if is_train:
                 pl_module.train()
@@ -523,7 +523,7 @@ if __name__ == "__main__":
                 "verbose": True,
                 "save_last": True,
                 "monitor": "train/rec_loss_epoch",
-                "save_top_k": 1,
+                "save_top_k": 3,
                 "every_n_epochs": 1
             }
         }
@@ -574,7 +574,7 @@ if __name__ == "__main__":
                 "target": "main.ImageLogger",
                 "params": {
                     "batch_frequency": 750,
-                    "max_images": config.data.params.batch_size,
+                    "max_images": 8,
                     "clamp": True
                 }
             },

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+MEM_FMT = torch.contiguous_format
 
 def count_params(model):
     total_params = sum(p.numel() for p in model.parameters())
@@ -20,14 +21,14 @@ class ActNorm(nn.Module):
 
     def initialize(self, input):
         with torch.no_grad():
-            flatten = input.permute(1, 0, 2, 3).contiguous().view(input.shape[1], -1)
+            flatten = input.permute(1, 0, 2, 3).contiguous(memory_format=MEM_FMT).view(input.shape[1], -1)
             mean = (
                 flatten.mean(1)
                 .unsqueeze(1)
                 .unsqueeze(2)
                 .unsqueeze(3)
                 .permute(1, 0, 2, 3)
-                .contiguous(memory_format=torch.contiguous_format) # fix stride warning
+                .contiguous(memory_format=MEM_FMT) # fix stride warning
             )
             std = (
                 flatten.std(1)
@@ -35,7 +36,7 @@ class ActNorm(nn.Module):
                 .unsqueeze(2)
                 .unsqueeze(3)
                 .permute(1, 0, 2, 3)
-                .contiguous(memory_format=torch.contiguous_format) # fix stride warning
+                .contiguous(memory_format=MEM_FMT) # fix stride warning
             )
 
             self.loc.data.copy_(-mean)

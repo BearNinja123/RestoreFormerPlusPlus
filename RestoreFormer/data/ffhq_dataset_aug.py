@@ -112,8 +112,7 @@ class FFHQAugDataset(data.Dataset):
             img_gt = img_gt_pad[shift_v:shift_v + h, shift_h: shift_h + w,:]
 
         # BGR to RGB, HWC to CHW, numpy to tensor
-        #img_gt = img2tensor(img_gt, bgr2rgb=True, float32=True)
-        img_gt = img2tensor(img_gt, bgr2rgb=False, float32=True) # is already rgb
+        img_gt = img2tensor(img_gt, bgr2rgb=True, float32=True)
         # normalize
         normalize(img_gt, self.mean, self.std, inplace=True)
 

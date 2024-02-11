@@ -62,7 +62,7 @@ class VectorQuantizer(nn.Module):
         z_q = z + (z_q - z).detach()
 
         # reshape back to match original input shape
-        z_q = z_q.permute(0, 3, 1, 2) #.contiguous(memory_format=torch.channels_last)
+        z_q = z_q.permute(0, 3, 1, 2) #.contiguous(memory_format=MEM_FMT)
         return z_q, loss, (None, None, min_encoding_indices, d)
 
     def get_codebook_entry(self, indices, shape):
@@ -73,7 +73,7 @@ class VectorQuantizer(nn.Module):
             z_q = z_q.view(shape)
 
             # reshape back to match original input shape
-            z_q = z_q.permute(0, 3, 1, 2) #.contiguous(memory_format=torch.channels_last)
+            z_q = z_q.permute(0, 3, 1, 2) #.contiguous(memory_format=MEM_FMT)
 
         return z_q
 
@@ -82,6 +82,8 @@ if NORM == 'GN':
     nonlinearity = lambda x: x # nonlinearity fused into GN kernel
 else:
     nonlinearity = F.silu
+
+MEM_FMT = torch.contiguous_format
 
 class BN_Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
     def __init__(self, in_channels: int, num_groups: int = 32):
@@ -92,16 +94,16 @@ class BN_Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 
             return super().forward(x)
 
 class GN_NN_Normalize(nn.GroupNorm): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
-    def __init__(self, in_channels: int, num_groups: int = 32):
-        super().__init__(num_groups, in_channels)
+    def __init__(self, in_channels: int, channels_per_group: int = 16):
+        super().__init__(in_channels // channels_per_group, in_channels)
     
     def forward(self, x):
         with torch.autocast('cuda', enabled=False):
             return super().forward(x)
 
 class GN_Normalize(GN_NHWC): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
-    def __init__(self, in_channels: int, num_groups: int = 32):
-        super().__init__(num_groups, in_channels)
+    def __init__(self, in_channels: int, channels_per_group: int = 16):
+        super().__init__(in_channels // channels_per_group, in_channels)
     
     def forward(self, x):
         #with torch.autocast('cuda', enabled=False):
@@ -277,7 +279,7 @@ class MultiHeadAttnBlock(nn.Module):
 
         # compute attention
         att = F.scaled_dot_product_attention(q, k, v)
-        catted = att.transpose(2, 3).reshape(B, C, H, W) #.contiguous(memory_format=torch.channels_last) # M H N D -> M H D N -> B C H W
+        catted = att.transpose(2, 3).reshape(B, C, H, W) #.contiguous(memory_format=MEM_FMT) # M H N D -> M H D N -> B C H W
 
         return x + self.proj_out(catted)
 

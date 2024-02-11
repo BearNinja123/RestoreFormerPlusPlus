@@ -85,6 +85,13 @@ class RestoreFormerModel(pl.LightningModule):
         dec, diff, info, hs, penult = self.vqvae(input)
         return dec, diff, info, hs, penult
 
+    @property
+    def global_step(self): # needed since pytorch lightning increments global step with every optimizer step instead of every call to training_step 
+        gs = super().global_step
+        if gs >= 2 * self.disc_start and self.use_facial_disc:
+            return (gs + 3 * self.disc_start) // 5
+        return gs // 2
+
     '''
     PL 2.1.2
     Training with multiple optimizers is only supported with manual optimization.
@@ -123,7 +130,7 @@ class RestoreFormerModel(pl.LightningModule):
         self.manual_backward(d_loss)
         opts[1].step() 
         
-        if self.disc_start <= self.global_step and self.use_facial_disc:
+        if self.global_step >= self.disc_start and self.use_facial_disc:
             # left eye, right eye, and mouth loss
             for opt, loss_component in zip(opts[2:5], (d_left_eye_loss, d_right_eye_loss, d_mouth_loss)):
                 opt.zero_grad()
