@@ -4,7 +4,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from custom_ops.custom_gn import GN_NHWC, GN_NCHW
+import math
+#from custom_ops.custom_gn import GN_NHWC, GN_NCHW
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True) # apparently this is as fast as flash attn but more flexible
@@ -75,8 +76,8 @@ class VectorQuantizer(nn.Module):
 
         return z_q
 
-nonlinearity = F.silu
-#nonlinearity = lambda x: x
+#nonlinearity = F.silu
+nonlinearity = lambda x: x
 
 NORM = 'GN NN'
 MEM_FMT = torch.contiguous_format
@@ -97,6 +98,8 @@ class GN_NN_Normalize(nn.GroupNorm): # runs BatchNorm in FP32 because of float16
         with torch.autocast('cuda', enabled=False):
             return super().forward(x)
 
+'''
+not yet
 class GN_Normalize(GN_NHWC): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
     def __init__(self, in_channels: int, channels_per_group: int = 16):
         super().__init__(in_channels // channels_per_group, in_channels)
@@ -106,6 +109,7 @@ class GN_Normalize(GN_NHWC): # runs BatchNorm in FP32 because of float16 stabili
             if 'SFAST' in NORM:
                 return group_norm_silu(x, self.num_groups, self.weight, self.bias, self.eps)
             return super().forward(x)
+'''
 
 if NORM == 'BN':
     Normalize = BN_Normalize
@@ -114,13 +118,85 @@ elif NORM == 'GN NN':
 else:
     Normalize = GN_Normalize
 
+class ConvLoRA(nn.Module):
+    '''
+    Copied from https://github.com/microsoft/LoRA/blob/main/loralib/layers.py
+    '''
+    def __init__(self, in_channels, out_channels, kernel_size, r=0, lora_alpha=1, lora_dropout=0., merge_weights=True, **kwargs):
+        super(ConvLoRA, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, **kwargs)
+        self.merged = False
+        self.merge_weights = merge_weights
+        assert isinstance(kernel_size, int)
+        # Actual trainable parameters
+        if r > 0:
+            self.lora_A = nn.Parameter(self.conv.weight.new_zeros((r * kernel_size, in_channels * kernel_size)))
+            self.lora_B = nn.Parameter(self.conv.weight.new_zeros((out_channels//self.conv.groups*kernel_size, r*kernel_size)))
+            self.scaling = self.lora_alpha / self.r
+            # Freezing the pre-trained weight matrix
+            self.conv.weight.requires_grad = False
+        self.reset_parameters()
+        self.merged = False
+
+    def reset_parameters(self):
+        self.conv.reset_parameters()
+        if hasattr(self, 'lora_A'):
+            # initialize A the same way as the default for nn.Linear and B to zero
+            nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+            nn.init.zeros_(self.lora_B)
+
+    def train(self, mode=True):
+        super(ConvLoRA, self).train(mode)
+        if mode:
+            if self.merge_weights and self.merged:
+                if self.r > 0:
+                    # Make sure that the weights are not merged
+                    self.conv.weight.data -= (self.lora_B @ self.lora_A).view(self.conv.weight.shape) * self.scaling
+                self.merged = False
+        else:
+            if self.merge_weights and not self.merged:
+                if self.r > 0:
+                    # Merge the weights and mark it
+                    self.conv.weight.data += (self.lora_B @ self.lora_A).view(self.conv.weight.shape) * self.scaling
+                self.merged = True
+
+    def forward(self, x):
+        if self.r > 0 and not self.merged:
+            return self.conv._conv_forward(
+                x, 
+                self.conv.weight + (self.lora_B @ self.lora_A).view(self.conv.weight.shape) * self.scaling,
+                self.conv.bias
+            )
+        return self.conv(x)
+
+def conv_lora_set_weights(conv_layer: nn.Conv2d) -> ConvLoRA:
+    lora_layer = ConvLoRA(conv_layer.in_channels, conv_layer.out_channels, conv_layer.kernel_size)
+    lora_layer.conv.weight.data = conv_layer.weight.data
+    lora_layer.conv.bias.data = conv_layer.bias.data
+    return lora_layer
+
+def add_lora_adapters(module: nn.Module, layer_lora_fns={nn.Conv2d: conv_lora_set_weights}):
+    '''
+    Converts a pretrained model inplace to a model with LoRA adapters.
+    module:
+        An nn.Module (no LoRA layers) with loaded pretrained weights (i.e. a pretrained model)
+    layer_lora_fns:
+        a dictionary whose keys are layer classes and whose values represent a function that
+        takes in a layer and returns a LoRA layer with the same weights as the input layer
+    '''
+    for name, child in module.named_children():
+        if type(child) in layer_lora_fns:
+            lora_module = layer_lora_fns[type(child)](child)
+            setattr(module, name, lora_module)
+        add_lora_adapters(child, layer_lora_fns) # recursively call the function on the module's children
+
 class Upsample(nn.Module):
     def __init__(self, in_channels, with_conv):
         super().__init__()
         self.with_conv = with_conv
         #self.upsample = UpFirDnUpsample((1, 3, 3, 1))
         if self.with_conv:
-            self.conv = torch.nn.Conv2d(in_channels, in_channels, 3, padding=1)
+            self.conv = nn.Conv2d(in_channels, in_channels, 3, padding=1)
 
     def forward(self, x):
         #x = self.upsample(x)
@@ -135,7 +211,7 @@ class Downsample(nn.Module):
         self.with_conv = with_conv
         if self.with_conv:
             # no asymmetric padding in torch conv, must do it ourselves
-            self.conv = torch.nn.Conv2d(in_channels, in_channels, 3, stride=2)
+            self.conv = nn.Conv2d(in_channels, in_channels, 3, stride=2)
 
     def forward(self, x):
         if self.with_conv:
@@ -154,15 +230,15 @@ class ResnetBlock(nn.Module):
         self.use_conv_shortcut = conv_shortcut
 
         self.norm1 = Normalize(in_channels)
-        self.conv1 = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
         self.norm2 = Normalize(out_channels)
-        self.conv2 = torch.nn.Conv2d(out_channels, out_channels, 3, padding=1)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
-                self.conv_shortcut = torch.nn.Conv2d(in_channels, out_channels, 3, padding=1)
+                self.conv_shortcut = nn.Conv2d(in_channels, out_channels, 3, padding=1)
             else:
-                self.nin_shortcut = torch.nn.Conv2d(in_channels, out_channels, 1)
+                self.nin_shortcut = nn.Conv2d(in_channels, out_channels, 1)
 
     def forward(self, x, temb):
         h = self.conv1(nonlinearity(self.norm1(x)))
@@ -184,10 +260,10 @@ class MultiHeadAttnBlock(nn.Module):
         if y_channels is not None:
             self.norm2 = Normalize(y_ch)
 
-        self.q = torch.nn.Conv2d(y_ch, in_channels, 1) # kinda strange how the y (cross attention input) goes into the query but this is how RF++ does it
-        self.k = torch.nn.Conv2d(in_channels, in_channels, 1)
-        self.v = torch.nn.Conv2d(in_channels, in_channels, 1)
-        self.proj_out = torch.nn.Conv2d(in_channels, in_channels, 1)
+        self.q = nn.Conv2d(y_ch, in_channels, 1) # kinda strange how the y (cross attention input) goes into the query but this is how RF++ does it
+        self.k = nn.Conv2d(in_channels, in_channels, 1)
+        self.v = nn.Conv2d(in_channels, in_channels, 1)
+        self.proj_out = nn.Conv2d(in_channels, in_channels, 1)
 
     def split_heads(self, x):
         B, _C, H, W = x.shape
@@ -207,10 +283,12 @@ class MultiHeadAttnBlock(nn.Module):
         return x + self.proj_out(catted)
 
 class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference embedding
-    def __init__(self, ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
-                 attn_resolutions=[16], dropout=0.0, resamp_with_conv=True, in_channels=3,
-                 resolution=512, z_channels=256, double_z=True, enable_mid=True,
-                 head_size=1, **ignore_kwargs):
+    def __init__(
+            self, ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
+            attn_resolutions=[16], dropout=0.0, resamp_with_conv=True, in_channels=3,
+            resolution=512, z_channels=256, double_z=True, enable_mid=True,
+            head_size=1, **ignore_kwargs
+    ):
         super().__init__()
         self.ch = ch
         self.ref_ch = ref_ch
@@ -221,7 +299,7 @@ class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference emb
         self.enable_mid = enable_mid
 
         # downsampling
-        self.conv_in = torch.nn.Conv2d(in_channels, self.ch, 3, padding=1)
+        self.conv_in = nn.Conv2d(in_channels, self.ch, 3, padding=1)
         block_out = self.ch
 
         curr_res = resolution
@@ -252,7 +330,7 @@ class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference emb
 
         # end
         self.norm_out = Normalize(block_out)
-        self.conv_out = torch.nn.Conv2d(block_out, 2 * z_channels if double_z else z_channels, 3, padding=1)
+        self.conv_out = nn.Conv2d(block_out, 2 * z_channels if double_z else z_channels, 3, padding=1)
 
     def forward(self, x, x_ref=None): # x_ref.shape = (N, ref_ch, H, W)
         hs = {}
@@ -291,10 +369,12 @@ class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference emb
         return hs
 
 class MultiHeadDecoder(nn.Module):
-    def __init__(self, ch, out_ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
-                 attn_resolutions=16, dropout=0.0, resamp_with_conv=True, in_channels=3,
-                 resolution=512, z_channels=256, give_pre_end=False, enable_mid=True,
-                 head_size=1, ex_multi_scale_num=0, **ignorekwargs):
+    def __init__(
+            self, ch, out_ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
+            attn_resolutions=16, dropout=0.0, resamp_with_conv=True, in_channels=3,
+            resolution=512, z_channels=256, give_pre_end=False, enable_mid=True,
+            head_size=1, ex_multi_scale_num=0, **ignorekwargs
+    ):
         super().__init__()
         self.ch = ch
         self.ref_ch = ref_ch
@@ -314,7 +394,7 @@ class MultiHeadDecoder(nn.Module):
 
         # z to block_in
         block_out = ch * ch_mult[-1]
-        self.conv_in = torch.nn.Conv2d(z_channels, block_out, 3, padding=1)
+        self.conv_in = nn.Conv2d(z_channels, block_out, 3, padding=1)
 
         # middle
         if self.enable_mid:
@@ -344,7 +424,7 @@ class MultiHeadDecoder(nn.Module):
 
         # end
         self.norm_out = Normalize(block_out)
-        self.conv_out = torch.nn.Conv2d(block_out, out_ch, 3, padding=1)
+        self.conv_out = nn.Conv2d(block_out, out_ch, 3, padding=1)
 
     def forward(self, z, hs=None, x_ref=None):
         self.last_z_shape = z.shape
@@ -394,26 +474,28 @@ class MultiHeadDecoder(nn.Module):
 MultiHeadDecoderTransformer = MultiHeadDecoder # for backwards compatibility
 
 class VQVAEGANMultiHeadTransformer(nn.Module):
-    def __init__(self,
-                 n_embed=1024,
-                 embed_dim=256,
-                 ch=64,
-                 out_ch=3,
-                 ref_ch=None,
-                 ch_mult=(1, 2, 2, 4, 4, 8),
-                 num_res_blocks=2,
-                 attn_resolutions=(16, ),
-                 dropout=0.0,
-                 in_channels=3,
-                 resolution=512,
-                 z_channels=256,
-                 double_z=False,
-                 enable_mid=True,
-                 fix_decoder=False,
-                 fix_codebook=True,
-                 fix_encoder=False,
-                 head_size=4,
-                 ex_multi_scale_num=1):
+    def __init__(
+            self,
+            n_embed=1024,
+            embed_dim=256,
+            ch=64,
+            out_ch=3,
+            ref_ch=None,
+            ch_mult=(1, 2, 2, 4, 4, 8),
+            num_res_blocks=2,
+            attn_resolutions=(16, ),
+            dropout=0.0,
+            in_channels=3,
+            resolution=512,
+            z_channels=256,
+            double_z=False,
+            enable_mid=True,
+            fix_decoder=False,
+            fix_codebook=True,
+            fix_encoder=False,
+            head_size=4,
+            ex_multi_scale_num=1
+    ):
         super(VQVAEGANMultiHeadTransformer, self).__init__()
 
         self.encoder = MultiHeadEncoder(ch=ch, out_ch=out_ch, ref_ch=ref_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
@@ -421,9 +503,9 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
                                resolution=resolution, z_channels=z_channels, double_z=double_z, 
                                enable_mid=enable_mid, head_size=head_size)
 
-        self.quant_conv = torch.nn.Conv2d(z_channels, embed_dim, 1)
+        self.quant_conv = nn.Conv2d(z_channels, embed_dim, 1)
         self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
-        self.post_quant_conv = torch.nn.Conv2d(embed_dim, z_channels, 1)
+        self.post_quant_conv = nn.Conv2d(embed_dim, z_channels, 1)
 
         #for i in range(ex_multi_scale_num):
         #        attn_resolutions = [attn_resolutions[0], attn_resolutions[-1]*2]
@@ -467,25 +549,27 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
 
 class VQVAEGAN(VQVAEGANMultiHeadTransformer): # VQVAEGANMultiHeadTransformer but fix_encoder=False and ex_multi_scale_num=0
     # note: default values of init args are the same as VQVAEGANMultiHeadTransformer
-    def __init__(self,
-                 n_embed=1024,
-                 embed_dim=256,
-                 ch=64,
-                 out_ch=3,
-                 ref_ch=None,
-                 ch_mult=(1, 2, 2, 4, 4, 8),
-                 num_res_blocks=2,
-                 attn_resolutions=(16, ),
-                 dropout=0.0,
-                 in_channels=3,
-                 resolution=512,
-                 z_channels=256,
-                 double_z=False,
-                 enable_mid=True,
-                 fix_decoder=False,
-                 fix_codebook=True,
-                 head_size=4,
-                 **ignore_kwargs):
+    def __init__(
+            self,
+            n_embed=1024,
+            embed_dim=256,
+            ch=64,
+            out_ch=3,
+            ref_ch=None,
+            ch_mult=(1, 2, 2, 4, 4, 8),
+            num_res_blocks=2,
+            attn_resolutions=(16, ),
+            dropout=0.0,
+            in_channels=3,
+            resolution=512,
+            z_channels=256,
+            double_z=False,
+            enable_mid=True,
+            fix_decoder=False,
+            fix_codebook=True,
+            head_size=4,
+            **ignore_kwargs
+    ):
         super(VQVAEGAN, self).__init__(
             n_embed, embed_dim, ch, out_ch, ref_ch, ch_mult, num_res_blocks,
             attn_resolutions, dropout, in_channels, resolution,
