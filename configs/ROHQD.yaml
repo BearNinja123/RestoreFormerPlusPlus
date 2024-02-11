@@ -16,7 +16,7 @@ model:
         resolution: 512
         in_channels: 3
         out_ch: 3
-        ch: 64
+        ch: 32
         ch_mult: [1,2,2,4,4,8]  # num_down = len(ch_mult)-1
         num_res_blocks: 2
         attn_resolutions: [16, 32, 64, 128]
@@ -41,7 +41,7 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 16 # per device
+    batch_size: 32 # per device
     num_workers: 7
     train:
       target: RestoreFormer.data.ffhq_dataset_aug.FFHQAugDataset

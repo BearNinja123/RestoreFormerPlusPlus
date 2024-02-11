@@ -184,7 +184,7 @@ class FFHQDegradationDataset(data.Dataset):
                 img_gt = np.tile(img_gt[:, :, None], [1, 1, 3])
 
         # BGR to RGB, HWC to CHW, numpy to tensor
-        img_gt, img_lq = img2tensor([img_gt, img_lq], bgr2rgb=False, float32=True) # already RGB
+        img_gt, img_lq = img2tensor([img_gt, img_lq], bgr2rgb=True, float32=True)
 
         # random color jitter (pytorch version) (only for lq)
         if self.color_jitter_pt_prob is not None and (np.random.uniform() < self.color_jitter_pt_prob):

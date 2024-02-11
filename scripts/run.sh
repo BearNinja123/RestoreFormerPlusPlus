@@ -5,8 +5,8 @@ export BASICSR_JIT=True
 # conf_name='RestoreFormer'
 
 # For RestoreFormer++
-#conf_name='ROHQD'
-conf_name='RestoreFormerPlusPlus'
+conf_name='ROHQD'
+#conf_name='RestoreFormerPlusPlus'
 
 root_path='/scratch/tnguy231/RFExperiments/tnguy231'
 
