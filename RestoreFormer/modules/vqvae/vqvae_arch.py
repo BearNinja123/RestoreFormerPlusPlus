@@ -1,11 +1,12 @@
 #from basicsr.archs.stylegan2_arch import UpFirDnUpsample
-#from sfast.triton.torch_ops import group_norm_silu
+from sfast.triton.torch_ops import group_norm_silu, group_norm
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-#from custom_ops.custom_gn import GN_NHWC, GN_NCHW
+from gnNHWC.custom_gn import GN_NHWC, GN_NCHW
+import gnNHWC.custom_gn as mygn
 torch.backends.cuda.enable_flash_sdp(False)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
 torch.backends.cuda.enable_math_sdp(True) # apparently this is as fast as flash attn but more flexible
@@ -76,10 +77,11 @@ class VectorQuantizer(nn.Module):
 
         return z_q
 
-#nonlinearity = F.silu
-nonlinearity = lambda x: x
-
-NORM = 'GN NN'
+NORM = 'GN'
+if NORM == 'GN':
+    nonlinearity = lambda x: x # nonlinearity fused into GN kernel
+else:
+    nonlinearity = F.silu
 
 class BN_Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
     def __init__(self, in_channels: int, num_groups: int = 32):
@@ -97,18 +99,16 @@ class GN_NN_Normalize(nn.GroupNorm): # runs BatchNorm in FP32 because of float16
         with torch.autocast('cuda', enabled=False):
             return super().forward(x)
 
-'''
-not yet
 class GN_Normalize(GN_NHWC): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
     def __init__(self, in_channels: int, num_groups: int = 32):
         super().__init__(num_groups, in_channels)
     
     def forward(self, x):
-        with torch.autocast('cuda', enabled=False):
-            if 'SFAST' in NORM:
-                return group_norm_silu(x, self.num_groups, self.weight, self.bias, self.eps)
-            return super().forward(x)
-'''
+        #with torch.autocast('cuda', enabled=False):
+        if 'SFAST' in NORM:
+           #return group_norm_silu(x, self.num_groups, self.weight, self.bias, self.eps)
+            return group_norm(x, self.num_groups, self.weight, self.bias, self.eps)
+        return super().forward(x)
 
 if NORM == 'BN':
     Normalize = BN_Normalize
