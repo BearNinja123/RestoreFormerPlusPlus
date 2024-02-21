@@ -6,12 +6,13 @@ Notable changes:
 - Updated library requirements
 - more config options (when training ROHQD)
 - Pytorch profiler support
-- A collection of CUDA kernels for NHWC Group Norm which outperform both Pytorch's native GN NCHW kernels AND stable-fast's Triton NHWC kernels (only fwd implemented so far, only tested on 3060 Max-Q)
+- A collection of CUDA kernels for NHWC Group Norm which outperform both Pytorch's native GN NCHW kernels AND stable-fast's Triton NHWC kernels
+  - 40% training speedup + additional 30% memory savings (so 2.8x faster training, 28% memory usage from original RF++)
 
 ## Environment
 
 - python>=3.9
-- pytorch>=2.1.1
+- pytorch>=2.2
 - pytorch-lightning==2.1.2
 - omegaconf>=2.0.0
 - basicsr>=1.4.2

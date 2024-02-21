@@ -1,15 +1,12 @@
-#from basicsr.archs.stylegan2_arch import UpFirDnUpsample
-from sfast.triton.torch_ops import group_norm_silu, group_norm
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 from gnNHWC.custom_gn import GN_NHWC, GN_NCHW
-import gnNHWC.custom_gn as mygn
-torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_flash_sdp(True)
 torch.backends.cuda.enable_mem_efficient_sdp(False)
-torch.backends.cuda.enable_math_sdp(True) # apparently this is as fast as flash attn but more flexible
+torch.backends.cuda.enable_math_sdp(False) # apparently this is as fast as flash attn but more flexible
 torch.backends.cudnn.benchmark = True
 
 class VectorQuantizer(nn.Module):
@@ -80,13 +77,13 @@ class VectorQuantizer(nn.Module):
 NORM = 'GN'
 if NORM == 'GN':
     nonlinearity = lambda x: x # nonlinearity fused into GN kernel
+    MEM_FMT = torch.channels_last
 else:
     nonlinearity = F.silu
-
-MEM_FMT = torch.contiguous_format
+    MEM_FMT = torch.contiguous_format
 
 class BN_Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
-    def __init__(self, in_channels: int, num_groups: int = 32):
+    def __init__(self, in_channels: int, num_groups: int = 32, **ignorekwargs):
         super().__init__(in_channels)
     
     def forward(self, x):
@@ -94,7 +91,7 @@ class BN_Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 
             return super().forward(x)
 
 class GN_NN_Normalize(nn.GroupNorm): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
-    def __init__(self, in_channels: int, channels_per_group: int = 16):
+    def __init__(self, in_channels: int, channels_per_group: int = 16, **ignorekwargs):
         super().__init__(in_channels // channels_per_group, in_channels)
     
     def forward(self, x):
@@ -102,15 +99,12 @@ class GN_NN_Normalize(nn.GroupNorm): # runs BatchNorm in FP32 because of float16
             return super().forward(x)
 
 class GN_Normalize(GN_NHWC): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
-    def __init__(self, in_channels: int, channels_per_group: int = 16):
-        super().__init__(in_channels // channels_per_group, in_channels)
+    def __init__(self, in_channels: int, channels_per_group: int = 16, activation='identity'):
+        super().__init__(in_channels // channels_per_group, in_channels, activation)
     
     def forward(self, x):
-        #with torch.autocast('cuda', enabled=False):
-        if 'SFAST' in NORM:
-           #return group_norm_silu(x, self.num_groups, self.weight, self.bias, self.eps)
-            return group_norm(x, self.num_groups, self.weight, self.bias, self.eps)
-        return super().forward(x)
+        with torch.autocast('cuda', enabled=False):
+            return super().forward(x)
 
 if NORM == 'BN':
     Normalize = BN_Normalize
@@ -230,10 +224,10 @@ class ResnetBlock(nn.Module):
         self.out_channels = out_channels
         self.use_conv_shortcut = conv_shortcut
 
-        self.norm1 = Normalize(in_channels)
+        self.norm1 = Normalize(in_channels, activation='silu')
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
 
-        self.norm2 = Normalize(out_channels)
+        self.norm2 = Normalize(out_channels, activation='silu')
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
@@ -269,7 +263,7 @@ class MultiHeadAttnBlock(nn.Module):
     def split_heads(self, x):
         B, _C, H, W = x.shape
         # B (hD) H W -> B h D (HW) -> B h (HW) D, D = d_head (self.att_size), h = num heads (self.head_size)
-        return x.view(B, self.head_size, self.att_size, H * W).permute(0, 3, 1, 2) #.contiguous()
+        return x.view(B, self.head_size, self.att_size, H * W).transpose(2, 3) #.contiguous()
     
     def forward(self, x, y=None):
         B, C, H, W = x.shape
@@ -330,7 +324,7 @@ class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference emb
                 self.mid.cross_attn = MultiHeadAttnBlock(block_out, head_size, y_channels=ref_ch)
 
         # end
-        self.norm_out = Normalize(block_out)
+        self.norm_out = Normalize(block_out, activation='silu')
         self.conv_out = nn.Conv2d(block_out, 2 * z_channels if double_z else z_channels, 3, padding=1)
 
     def forward(self, x, x_ref=None): # x_ref.shape = (N, ref_ch, H, W)
@@ -424,7 +418,7 @@ class MultiHeadDecoder(nn.Module):
             self.up.insert(0, up) # prepend to get consistent order
 
         # end
-        self.norm_out = Normalize(block_out)
+        self.norm_out = Normalize(block_out, activation='silu')
         self.conv_out = nn.Conv2d(block_out, out_ch, 3, padding=1)
 
     def forward(self, z, hs=None, x_ref=None):

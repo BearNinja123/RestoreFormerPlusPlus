@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from main import instantiate_from_config
 import warnings
+import time, math
 warnings.filterwarnings('ignore')
 
 from RestoreFormer.modules.vqvae.utils import get_roi_regions
@@ -10,7 +11,7 @@ from RestoreFormer.modules.vqvae.utils import get_roi_regions
 def count_params(module):
     return sum(p.numel() for p in module.parameters())
 
-MEM_FMT = torch.contiguous_format
+MEM_FMT = torch.channels_last
 
 class RestoreFormerModel(pl.LightningModule):
     def __init__(self,
@@ -100,6 +101,13 @@ class RestoreFormerModel(pl.LightningModule):
     '''
     def training_step(self, batch, batch_idx):
         #x = (batch[self.image_key] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
+        is_power_2 = lambda x: int(math.log2(x)) == math.log2(x)
+        if batch_idx == 0:
+            self.tic = time.time()
+        if self.global_rank == 0 and batch_idx > 16 and is_power_2(batch_idx + 1): # 16 is arbitrary, checking if batchidx +/- 1 is power of 2 to make sure logging images for visual inspection isn't included in the step speed
+            print('it/s', (batch_idx / 2 - 2)/(time.time() - self.tic))
+        if batch_idx > 16 and is_power_2(batch_idx - 1):
+            self.tic = time.time()
         x = batch[self.image_key]
         xrec, qloss, info, hs, penult = self(x)
 
@@ -123,12 +131,16 @@ class RestoreFormerModel(pl.LightningModule):
         # generator
         opts[0].zero_grad()
         self.manual_backward(loss)
-        opts[0].step() 
 
         # discriminator
         opts[1].zero_grad()
         self.manual_backward(d_loss)
-        opts[1].step() 
+
+        #@torch.compile # compiling isn't any faster but keeping it here to remind myself that it won't help
+        def fn():
+            opts[0].step() 
+            opts[1].step() 
+        fn()
         
         if self.global_step >= self.disc_start and self.use_facial_disc:
             # left eye, right eye, and mouth loss
@@ -178,7 +190,6 @@ class RestoreFormerModel(pl.LightningModule):
         opt_ae_params = [{'params': normal_params, 'lr': lr},
                          {'params': special_params, 'lr': lr*self.special_params_lr_scale}]
         opt_ae = torch.optim.Adam(opt_ae_params, betas=(0.5, 0.9), fused=True)
-        #opt_ae = torch.optim.Adam(self.vqvae.parameters(), betas=(0.5, 0.9), fused=True)
         opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
                                     lr=lr, betas=(0.5, 0.9), fused=True)
 

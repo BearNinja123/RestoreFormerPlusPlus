@@ -3,7 +3,7 @@ model:
   target: RestoreFormer.models.vqgan_v1.RestoreFormerModel
   params:
     image_key: 'gt'
-    #ckpt_path: /scratch/tnguy231/RFExperiments/tnguy231/logs/2023-12-20T17-34-11_ROHQDROHQD_gpus1_seed76/checkpoints/epoch=000067.ckpt
+    ckpt_path: /scratch/tnguy231/RFExperiments/tnguy231/logs/2024-02-21T02-10-12_ROHQDROHQD_gpus1_seed91/checkpoints/last.ckpt
     schedule_step: [100000, 200000]
     # ignore_keys: ['vqvae.quantize.utility_counter']
     ddconfig:
@@ -19,7 +19,7 @@ model:
         ch: 32
         ch_mult: [1,2,2,4,4,8]  # num_down = len(ch_mult)-1
         num_res_blocks: 2
-        attn_resolutions: [16, 32, 64, 128]
+        attn_resolutions: [16, 32, 64]
         dropout: 0.0
         enable_mid: True
         fix_decoder: False
@@ -46,7 +46,7 @@ data:
     train:
       target: RestoreFormer.data.ffhq_dataset_aug.FFHQAugDataset
       params:
-        dataroot_gt: /scratch/tnguy231/FFHQ/image512x512
+        dataroot_gt: /scratch/tnguy231/data/ffhq512
         io_backend:
           type: disk
         use_hflip: True

@@ -14,9 +14,6 @@ from RestoreFormer.modules.vqvae.arcface_arch import ResNetArcFace
 from RestoreFormer.modules.vqvae.facial_component_discriminator import \
     FacialComponentDiscriminator
 
-
-MEM_FMT = torch.contiguous_format
-
 class DummyLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -52,18 +49,18 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         assert disc_loss in ["hinge", "vanilla"]
         self.codebook_weight = codebook_weight
         self.pixel_weight = pixelloss_weight
-        self.perceptual_loss = LPIPS(style_weight=lpips_style_weight).to(memory_format=MEM_FMT).eval()
+        self.perceptual_loss = LPIPS(style_weight=lpips_style_weight)
         self.perceptual_weight = perceptual_weight
 
         self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels,
                                                  n_layers=disc_num_layers,
                                                  use_actnorm=use_actnorm,
                                                  ndf=disc_ndf
-                                                 ).apply(weights_init).to(memory_format=MEM_FMT)
+                                                 ).apply(weights_init)
         if comp_weight > 0:
-            self.net_d_left_eye = FacialComponentDiscriminator().to(memory_format=MEM_FMT)
-            self.net_d_right_eye = FacialComponentDiscriminator().to(memory_format=MEM_FMT)
-            self.net_d_mouth = FacialComponentDiscriminator().to(memory_format=MEM_FMT)
+            self.net_d_left_eye = FacialComponentDiscriminator()
+            self.net_d_right_eye = FacialComponentDiscriminator()
+            self.net_d_mouth = FacialComponentDiscriminator()
             print(f'Use components discrimination')
 
             self.cri_component = GANLoss(gan_type=comp_disc_loss, 
@@ -77,7 +74,7 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         if identity_weight > 0:
             self.identity = ResNetArcFace(block = 'IRBlock', 
                                           layers = [2, 2, 2, 2],
-                                          use_se = False).to(memory_format=MEM_FMT)
+                                          use_se = False)
             print(f'Use identity loss')
             if identity_model_path is not None:
                 sd = torch.load(identity_model_path, map_location="cpu")
