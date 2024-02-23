@@ -11,3 +11,11 @@ results/
 # private only
 no_release/
 no_release_bk/
+
+./__pycache__/
+./gnNHWC/__pycache__/
+./RestoreFormer/__pycache__/
+./RestoreFormer/modules/vqvae/__pycache__/
+./RestoreFormer/modules/discriminator/__pycache__/
+./RestoreFormer/distributed/__pycache__/
+./RestoreFormer/data/__pycache__/

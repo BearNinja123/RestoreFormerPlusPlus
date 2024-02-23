@@ -1,3 +1,4 @@
+from gnNHWC.custom_gn import GN_NHWC
 import functools
 import torch.nn as nn
 import torch
@@ -9,13 +10,13 @@ def weights_init(m):
     classname = m.__class__.__name__
     if classname.find('Conv') != -1:
         nn.init.normal_(m.weight.data, 0.0, 0.02)
-    elif classname.find('BatchNorm') != -1:
+    elif classname.find('Normalize') != -1:
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0)
 
-class Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
-    def __init__(self, in_channels: int, num_groups: int = 32):
-        super().__init__(in_channels)
+class Normalize(GN_NHWC): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
+    def __init__(self, in_channels: int, channels_per_group: int = 16, activation='identity'):
+        super().__init__(in_channels // channels_per_group, in_channels, activation)
     
     def forward(self, x):
         with torch.autocast('cuda', enabled=False):
@@ -34,17 +35,19 @@ class NLayerDiscriminator(nn.Module):
             norm_layer      -- normalization layer
         """
         super(NLayerDiscriminator, self).__init__()
-        if not use_actnorm:
-            #norm_layer = nn.BatchNorm2d
-            norm_layer = Normalize
-        else:
-            norm_layer = ActNorm
-        if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
-            #use_bias = norm_layer.func != nn.BatchNorm2d
-            use_bias = norm_layer.func != Normalize
-        else:
-            #use_bias = norm_layer != nn.BatchNorm2d
-            use_bias = norm_layer != Normalize
+        #if not use_actnorm:
+        #    #norm_layer = nn.BatchNorm2d
+        #    norm_layer = Normalize
+        #else:
+        #    norm_layer = ActNorm
+        #if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
+        #    #use_bias = norm_layer.func != nn.BatchNorm2d
+        #    use_bias = norm_layer.func != Normalize
+        #else:
+        #    #use_bias = norm_layer != nn.BatchNorm2d
+        #    use_bias = norm_layer != Normalize
+        norm_layer = Normalize
+        use_bias = False
 
         kw = 4
         padw = 1
@@ -56,16 +59,16 @@ class NLayerDiscriminator(nn.Module):
             nf_mult = min(2 ** n, 8)
             sequence += [
                 nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
-                norm_layer(ndf * nf_mult),
-                nn.LeakyReLU(0.2, True)
+                norm_layer(ndf * nf_mult, activation='gelu_tanh'),
+                #nn.LeakyReLU(0.2, True)
             ]
 
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
         sequence += [
             nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
-            norm_layer(ndf * nf_mult),
-            nn.LeakyReLU(0.2, True)
+            norm_layer(ndf * nf_mult, activation='gelu_tanh'),
+            #nn.LeakyReLU(0.2, True)
         ]
 
         sequence += [
@@ -89,14 +92,16 @@ class NLayerDiscriminator_v1(nn.Module):
             norm_layer      -- normalization layer
         """
         super(NLayerDiscriminator_v1, self).__init__()
-        if not use_actnorm:
-            norm_layer = nn.BatchNorm2d
-        else:
-            norm_layer = ActNorm
-        if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
-            use_bias = norm_layer.func != nn.BatchNorm2d
-        else:
-            use_bias = norm_layer != nn.BatchNorm2d
+        #if not use_actnorm:
+        #    norm_layer = nn.BatchNorm2d
+        #else:
+        #    norm_layer = ActNorm
+        #if type(norm_layer) == functools.partial:  # no need to use bias as BatchNorm2d has affine parameters
+        #    use_bias = norm_layer.func != nn.BatchNorm2d
+        #else:
+        #    use_bias = norm_layer != nn.BatchNorm2d
+        norm_layer = Normalize
+        use_bias = False
 
         self.n_layers = n_layers
 
@@ -114,16 +119,16 @@ class NLayerDiscriminator_v1(nn.Module):
 
             self.body.append(nn.Sequential(
                 nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
-                norm_layer(ndf * nf_mult),
-                nn.LeakyReLU(0.2, True)
+                norm_layer(ndf * nf_mult, activation='gelu_tanh'),
+                #nn.LeakyReLU(0.2, True)
             ))
 
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
         self.beforlast = nn.Sequential(
             nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
-            norm_layer(ndf * nf_mult),
-            nn.LeakyReLU(0.2, True)
+            norm_layer(ndf * nf_mult, activation='gelu_tanh'),
+            #nn.LeakyReLU(0.2, True)
         )
 
         self.final = nn.Sequential(
