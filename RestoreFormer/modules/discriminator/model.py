@@ -14,9 +14,9 @@ def weights_init(m):
         nn.init.normal_(m.weight.data, 1.0, 0.02)
         nn.init.constant_(m.bias.data, 0)
 
-class Normalize(GN_NHWC): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
-    def __init__(self, in_channels: int, channels_per_group: int = 16, activation='identity'):
-        super().__init__(in_channels // channels_per_group, in_channels, activation)
+class Normalize(nn.BatchNorm2d): # runs BatchNorm in FP32 because of float16 stability issues when x is large but with small variance (i.e. x = 100) 
+    def __init__(self, in_channels: int, channels_per_group: int = 16):
+        super().__init__(in_channels)
     
     def forward(self, x):
         with torch.autocast('cuda', enabled=False):
@@ -59,16 +59,16 @@ class NLayerDiscriminator(nn.Module):
             nf_mult = min(2 ** n, 8)
             sequence += [
                 nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=2, padding=padw, bias=use_bias),
-                norm_layer(ndf * nf_mult, activation='gelu_tanh'),
-                #nn.LeakyReLU(0.2, True)
+                norm_layer(ndf * nf_mult),
+                nn.LeakyReLU(0.2, True)
             ]
 
         nf_mult_prev = nf_mult
         nf_mult = min(2 ** n_layers, 8)
         sequence += [
             nn.Conv2d(ndf * nf_mult_prev, ndf * nf_mult, kernel_size=kw, stride=1, padding=padw, bias=use_bias),
-            norm_layer(ndf * nf_mult, activation='gelu_tanh'),
-            #nn.LeakyReLU(0.2, True)
+            norm_layer(ndf * nf_mult),
+            nn.LeakyReLU(0.2, True)
         ]
 
         sequence += [

@@ -50,6 +50,7 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         self.codebook_weight = codebook_weight
         self.pixel_weight = pixelloss_weight
         self.perceptual_loss = LPIPS(style_weight=lpips_style_weight)
+        print('percep loss nparams', sum(p.numel() for p in self.perceptual_loss.parameters()))
         self.perceptual_weight = perceptual_weight
 
         self.discriminator = NLayerDiscriminator(input_nc=disc_in_channels,
@@ -57,6 +58,7 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
                                                  use_actnorm=use_actnorm,
                                                  ndf=disc_ndf
                                                  ).apply(weights_init)
+        print('disc loss nparams', sum(p.numel() for p in self.discriminator.parameters()))
         if comp_weight > 0:
             self.net_d_left_eye = FacialComponentDiscriminator()
             self.net_d_right_eye = FacialComponentDiscriminator()
@@ -83,6 +85,7 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
                         sd[k[7:]] = v
                         sd.pop(k)
                 self.identity.load_state_dict(sd, strict=True)
+            print('arc nparams', sum(p.numel() for p in self.identity.parameters()))
 
             for param in self.identity.parameters():
                 param.requires_grad = False
