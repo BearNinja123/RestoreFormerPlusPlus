@@ -1,12 +1,14 @@
+from sfast.triton.torch_ops import group_norm_silu
 from gnNHWC.custom_gn import GN_NHWC
+from copy import deepcopy
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-torch.backends.cuda.enable_flash_sdp(True)
-torch.backends.cuda.enable_mem_efficient_sdp(False)
-torch.backends.cuda.enable_math_sdp(False) # apparently this is as fast as flash attn but more flexible
+#torch.backends.cuda.enable_flash_sdp(True)
+#torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True) # apparently this is as fast as flash attn but more flexible
 torch.backends.cudnn.benchmark = True
 
 class VectorQuantizer(nn.Module):
@@ -74,8 +76,8 @@ class VectorQuantizer(nn.Module):
 
         return z_q
 
-NORM = 'GN'
-if NORM == 'GN':
+NORM = 'GN NN'
+if NORM == 'GN' or 'SFAST' in NORM:
     nonlinearity = lambda x: x # nonlinearity fused into GN kernel
     MEM_FMT = torch.channels_last
 else:
@@ -105,6 +107,10 @@ class GN_Normalize(GN_NHWC): # runs BatchNorm in FP32 because of float16 stabili
     
     def forward(self, x):
         #with torch.autocast('cuda', enabled=False):
+        if 'SFAST' in NORM:
+            group_norm_silu(x, self.num_groups, self.weight, self.bias, self.eps)
+            return group_norm_silu(x, self.num_groups, self.weight, self.bias, self.eps)
+        super().forward(x)
         return super().forward(x)
 
 if NORM == 'BN':
@@ -278,16 +284,70 @@ class MultiHeadAttnBlock(nn.Module):
 
         return x + self.proj_out(catted)
 
+class CrossAttention(nn.Module):
+    def __init__(self, patch_size, in_channels, head_size=1, y_channels=None):
+        super().__init__()
+        self.patch_size = patch_size # input will be reshaped from BCHW -> B, (C * patch_size * patch_size, H / patch_size, W / patch_size)
+        self.in_channels = in_channels
+        self.head_size = head_size
+        self.att_size = in_channels // head_size
+        assert((patch_size * in_channels) % head_size == 0), 'The size of head should be divided by the number of channels.'
+        y_ch = in_channels if y_channels is None else y_channels
+
+        self.norm1 = Normalize(in_channels * patch_size * patch_size)
+        if y_channels is not None:
+            self.norm2 = Normalize(y_ch * patch_size * patch_size)
+
+        self.q = nn.Conv2d(y_ch * patch_size * patch_size, in_channels, 1) # kinda strange how the y (cross attention input) goes into the query but this is how RF++ does it
+        self.k = nn.Conv2d(in_channels * patch_size * patch_size, in_channels, 1)
+        self.v = nn.Conv2d(in_channels * patch_size * patch_size, in_channels, 1)
+        self.proj_out = nn.Conv2d(in_channels, in_channels * patch_size * patch_size, 1)
+
+    def split_heads(self, x):
+        B, _C, H, W = x.shape
+        # B (hD) H W -> B h D (HW) -> B h (HW) D, D = d_head (self.att_size), h = num heads (self.head_size)
+        return x.view(B, self.head_size, self.att_size, H * W).transpose(2, 3) #.contiguous()
+    
+    def forward(self, x, y=None):
+        B, C, H, W = x.shape
+        kv = self.norm1(x)
+        q = kv if y is None else self.norm2(y)
+        q, k, v = map(self.split_heads, (self.q(q), self.k(kv), self.v(kv)))
+
+        # compute attention
+        att = F.scaled_dot_product_attention(q, k, v)
+        catted = att.transpose(2, 3).reshape(B, C, H, W) #.contiguous(memory_format=MEM_FMT) # M H N D -> M H D N -> B C H W
+
+        return x + self.proj_out(catted)
+    
+    def forward(self, x, y):
+        B, C, H, W = x.shape
+        x_patched = x.view(B, C, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size)
+        x_flattened = x_patched.permute(0, 1, 3, 5, 2, 4).flatten(start_dim=1, end_dim=3)
+        y_patched = y.view(B, C, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size)
+        y_flattened = y_patched.permute(0, 1, 3, 5, 2, 4).flatten(start_dim=1, end_dim=3)
+
+        kv = self.norm1(x_flattened)
+        q = kv if y is None else self.norm2(y_flattened)
+        q, k, v = map(self.split_heads, (self.q(q), self.k(kv), self.v(kv)))
+
+        # compute attention
+        att = F.scaled_dot_product_attention(q, k, v)
+        catted = att.transpose(2, 3).reshape(B, C, H // self.patch_size, W // self.patch_size) #.contiguous(memory_format=MEM_FMT) # M H N D -> M H D N -> B C H W
+        patched_out = self.proj_out(catted)
+        unpatched_out = patched_out.view(B, C, self.patch_size, self.patch_size, H // self.patch_size, W // self.patch_size).permute(0, 1, 4, 2, 5, 3).reshape(B, C, H, W)
+
+        return x + unpatched_out
+
 class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference embedding
     def __init__(
-            self, ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
+            self, ch, ch_mult=(1,2,4,8), num_res_blocks=2,
             attn_resolutions=[16], dropout=0.0, resamp_with_conv=True, in_channels=3,
-            resolution=512, z_channels=256, double_z=True, enable_mid=True,
+            resolution=512, z_channels=256, double_z=False, enable_mid=True,
             head_size=1, **ignore_kwargs
     ):
         super().__init__()
         self.ch = ch
-        self.ref_ch = ref_ch
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
@@ -308,8 +368,7 @@ class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference emb
             down = nn.Module()
             down.block = nn.ModuleList(block)
             down.attn = nn.ModuleList(attn)
-            if isinstance(ref_ch, int):
-                down.cross_attn = MultiHeadAttnBlock(block_out, head_size, y_channels=ref_ch)
+
             if layer_idx != self.num_resolutions - 1:
                 down.downsample = Downsample(block_out, resamp_with_conv)
                 curr_res = curr_res // 2
@@ -321,14 +380,12 @@ class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference emb
             self.mid.block_1 = ResnetBlock(block_out, block_out, dropout=dropout)
             self.mid.attn_1 = MultiHeadAttnBlock(block_out, head_size)
             self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
-            if isinstance(ref_ch, int):
-                self.mid.cross_attn = MultiHeadAttnBlock(block_out, head_size, y_channels=ref_ch)
 
         # end
         self.norm_out = Normalize(block_out, activation='silu')
         self.conv_out = nn.Conv2d(block_out, 2 * z_channels if double_z else z_channels, 3, padding=1)
 
-    def forward(self, x, x_ref=None): # x_ref.shape = (N, ref_ch, H, W)
+    def forward(self, x):
         hs = {}
         # timestep embedding
         temb = None
@@ -341,8 +398,6 @@ class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference emb
                 h = self.down[i_level].block[i_block](h, temb)
                 if len(self.down[i_level].attn) > 0:
                     h = self.down[i_level].attn[i_block](h)
-                if x_ref is not None:
-                    h = self.down[i_level].cross_attn[i_block](x_ref, h) # x_ref is K/V, h is Q
 
             if i_level != self.num_resolutions-1:
                 hs['block_'+str(i_level)] = h
@@ -354,8 +409,6 @@ class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference emb
             hs['block_'+str(i_level)+'_atten'] = h
             h = self.mid.attn_1(h)
             h = self.mid.block_2(h, temb)
-            if x_ref is not None:
-                h = self.mid.cross_attn(x_ref, h)
             hs['mid_atten'] = h
 
         # end
@@ -366,14 +419,13 @@ class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference emb
 
 class MultiHeadDecoder(nn.Module):
     def __init__(
-            self, ch, out_ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
+            self, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks=2,
             attn_resolutions=16, dropout=0.0, resamp_with_conv=True, in_channels=3,
             resolution=512, z_channels=256, give_pre_end=False, enable_mid=True,
-            head_size=1, ex_multi_scale_num=0, **ignorekwargs
+            head_size=1, ex_multi_scale_num=0, cross_attn_patch_size=8, **ignorekwargs
     ):
         super().__init__()
         self.ch = ch
-        self.ref_ch = ref_ch
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
@@ -398,8 +450,6 @@ class MultiHeadDecoder(nn.Module):
             self.mid.block_1 = ResnetBlock(block_out, block_out, dropout=dropout)
             self.mid.attn_1 = MultiHeadAttnBlock(block_out, head_size)
             self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
-            if isinstance(ref_ch, int):
-                self.mid.cross_attn = MultiHeadAttnBlock(block_out, head_size, y_channels=ref_ch)
 
         # upsampling
         self.up = nn.ModuleList()
@@ -411,8 +461,6 @@ class MultiHeadDecoder(nn.Module):
             up = nn.Module()
             up.block = nn.ModuleList(block)
             up.attn = nn.ModuleList(attn)
-            if isinstance(ref_ch, int):
-                up.cross_attn = MultiHeadAttnBlock(block_out, head_size, y_channels=ref_ch)
             if layer_idx != self.num_resolutions - 1:
                 up.upsample = Upsample(block_out, resamp_with_conv)
                 curr_res = curr_res * 2
@@ -422,7 +470,7 @@ class MultiHeadDecoder(nn.Module):
         self.norm_out = Normalize(block_out, activation='silu')
         self.conv_out = nn.Conv2d(block_out, out_ch, 3, padding=1)
 
-    def forward(self, z, hs=None, x_ref=None):
+    def forward(self, z, hs=None):
         self.last_z_shape = z.shape
 
         # timestep embedding
@@ -434,8 +482,6 @@ class MultiHeadDecoder(nn.Module):
         # middle
         if self.enable_mid:
             h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h, temb)), temb)
-            if x_ref is not None:
-                h = self.mid.cross_attn(x_ref, h)
 
         # upsampling
         for rev_i_level, up_level in enumerate(reversed(self.up)):
@@ -452,9 +498,6 @@ class MultiHeadDecoder(nn.Module):
                         h = up_level.attn[i_block](h, hs['block_'+str(i_level)+'_atten'])
                     else:
                         h = up_level.attn[i_block](h, hs['block_'+str(i_level)])
-
-                    if x_ref is not None:
-                        h = up_level.cross_attn[i_block](x_ref, h)
             
             if i_level != 0:
                 h = up_level.upsample(h)
@@ -463,9 +506,8 @@ class MultiHeadDecoder(nn.Module):
         if self.give_pre_end:
             return h
 
-        penult = nonlinearity(self.norm_out(h))
-        h = self.conv_out(penult)
-        return h, penult
+        h = self.conv_out(nonlinearity(self.norm_out(h)))
+        return h
 
 MultiHeadDecoderTransformer = MultiHeadDecoder # for backwards compatibility
 
@@ -476,7 +518,6 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
             embed_dim=256,
             ch=64,
             out_ch=3,
-            ref_ch=None,
             ch_mult=(1, 2, 2, 4, 4, 8),
             num_res_blocks=2,
             attn_resolutions=(16, ),
@@ -494,7 +535,7 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
     ):
         super(VQVAEGANMultiHeadTransformer, self).__init__()
 
-        self.encoder = MultiHeadEncoder(ch=ch, out_ch=out_ch, ref_ch=ref_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+        self.encoder = MultiHeadEncoder(ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
                                resolution=resolution, z_channels=z_channels, double_z=double_z, 
                                enable_mid=enable_mid, head_size=head_size)
@@ -526,25 +567,285 @@ class VQVAEGANMultiHeadTransformer(nn.Module):
                 param.requires_grad = False
 	    
 
-    def encode(self, x, x_ref=None):
-        hs = self.encoder(x, x_ref=x_ref)
+    def encode(self, x):
+        hs = self.encoder(x)
         h = self.quant_conv(hs['out'])
         quant, emb_loss, info = self.quantize(h)
         return quant, emb_loss, info, hs
 
-    def decode(self, quant, hs=None, x_ref=None):
+    def decode(self, quant, hs=None):
         quant = self.post_quant_conv(quant)
-        dec, penult = self.decoder(quant, hs, x_ref=x_ref)
-        return dec, penult
+        dec = self.decoder(quant, hs)
+        return dec
 
-    def forward(self, input, x_ref=None):
-        quant, diff, info, hs = self.encode(input, x_ref=x_ref)
-        dec, penult = self.decode(quant, hs, x_ref=x_ref)
+    def forward(self, input):
+        quant, diff, info, hs = self.encode(input)
+        dec = self.decode(quant, hs)
 
-        return dec, diff, info, hs, penult
+        return dec, diff, info, hs
 
 class VQVAEGAN(VQVAEGANMultiHeadTransformer): # VQVAEGANMultiHeadTransformer but fix_encoder=False and ex_multi_scale_num=0
     # note: default values of init args are the same as VQVAEGANMultiHeadTransformer
+    def __init__(
+            self,
+            n_embed=1024,
+            embed_dim=256,
+            ch=64,
+            out_ch=3,
+            ch_mult=(1, 2, 2, 4, 4, 8),
+            num_res_blocks=2,
+            attn_resolutions=(16, ),
+            dropout=0.0,
+            in_channels=3,
+            resolution=512,
+            z_channels=256,
+            double_z=False,
+            enable_mid=True,
+            fix_decoder=False,
+            fix_codebook=True,
+            head_size=4,
+            **ignore_kwargs
+    ):
+        super(VQVAEGAN, self).__init__(
+            n_embed, embed_dim, ch, out_ch, ch_mult, num_res_blocks,
+            attn_resolutions, dropout, in_channels, resolution,
+            z_channels, double_z, enable_mid, fix_decoder, fix_codebook,
+            False, head_size, 0
+            )
+
+    def decode(self, quant):
+        quant = self.post_quant_conv(quant)
+        dec = self.decoder(quant)
+        return dec
+
+    def forward(self, input):
+        quant, diff, info, hs = self.encode(input)
+        dec = self.decode(quant)
+        return dec, diff, info, hs
+
+class RBAEncoder(nn.Module): # ref_ch = channel count of the reference embedding
+    def __init__(
+            self, ch, ref_ch, ch_mult=(1,2,4,8), num_res_blocks=2,
+            attn_resolutions=[16], dropout=0.0, resamp_with_conv=True, in_channels=3,
+            resolution=512, z_channels=256, double_z=False, enable_mid=True,
+            head_size=1, cross_attn_patch_size=8, **ignore_kwargs
+    ):
+        super().__init__()
+        self.ch = ch
+        self.ref_ch = ref_ch
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.in_channels = in_channels
+        self.enable_mid = enable_mid
+
+        # downsampling
+        self.conv_in = nn.Conv2d(in_channels, self.ch, 3, padding=1)
+        block_out = self.ch
+
+        curr_res = resolution
+        self.down = nn.ModuleList()
+        self.ref_down = nn.ModuleList()
+        for layer_idx, mult in enumerate(ch_mult):
+            block_in, block_out = block_out, ch * mult
+            block = [ResnetBlock(block_in, block_out, dropout=dropout)]
+            block += [ResnetBlock(block_out, block_out, dropout=dropout) for _ in range(self.num_res_blocks-1)]
+            attn = [MultiHeadAttnBlock(block_out, head_size) for _ in range(self.num_res_blocks)] if curr_res in attn_resolutions else []
+            down = nn.Module()
+            down.block = nn.ModuleList(block)
+            down.attn = nn.ModuleList(attn)
+            if layer_idx != self.num_resolutions - 1:
+                down.downsample = Downsample(block_out, resamp_with_conv)
+                curr_res = curr_res // 2
+            ref_down = deepcopy(down)
+            down.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
+            self.ref_down.ref_weight = nn.Parameter(torch.ones(()))
+
+            self.down.append(down)
+            self.ref_down.append(ref_down)
+
+        # middle
+        if self.enable_mid:
+            self.mid = nn.Module()
+            self.mid.block_1 = ResnetBlock(block_out, block_out, dropout=dropout)
+            self.mid.attn_1 = MultiHeadAttnBlock(block_out, head_size)
+            self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
+            self.ref_mid = deepcopy(self.mid)
+            self.mid.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
+            self.ref_mid.ref_weight = nn.Parameter(torch.ones(()))
+
+        # end
+        self.norm_out = Normalize(block_out, activation='silu')
+        self.conv_out = nn.Conv2d(block_out, 2 * z_channels if double_z else z_channels, 3, padding=1)
+
+    def forward(self, x, x_ref=None): # x_ref.shape = (N, ref_ch, H, W)
+        hs = {}
+        # timestep embedding
+        temb = None
+
+        # downsampling
+        h = self.conv_in(x)
+        h_ref = self.conv_in(x_ref)
+        hs['in'] = h
+        for i_level in range(self.num_resolutions):
+            level = self.down[i_level]
+            ref_level = self.ref_down[i_level]
+            for i_block in range(self.num_res_blocks):
+                h = level.block[i_block](h, temb)
+                h_ref = ref_level.block[i_block](h_ref, temb)
+                if len(level.attn) > 0:
+                    h = level.attn[i_block](h)
+                    h_ref = ref_level.ref_weight * ref_level.attn[i_block](h_ref)
+                if x_ref is not None:
+                    h = level.cross_attn(h_ref, h) # h_ref is K/V, h is Q
+
+            if i_level != self.num_resolutions-1:
+                hs['block_'+str(i_level)] = h
+                h = self.down[i_level].downsample(h)
+                h_ref = self.down[i_level].downsample(h_ref)
+
+        # middle
+        if self.enable_mid:
+            h = self.mid.block_1(h, temb)
+            hs['block_'+str(i_level)+'_atten'] = h
+            h = self.mid.attn_1(h)
+            h = self.mid.block_2(h, temb)
+
+            h_ref = self.ref_mid.block_1(h_ref, temb)
+            hs['block_'+str(i_level)+'_atten'] = h_ref
+            h_ref = self.ref_mid.attn_1(h_ref)
+            h_ref = self.ref_mid.ref_weight * self.ref_mid.block_2(h_ref, temb)
+            h = self.mid.cross_attn(h_ref, h)
+            hs['mid_atten'] = h
+
+        # end
+        h = self.conv_out(nonlinearity(self.norm_out(h)))
+        h_ref = self.conv_out(nonlinearity(self.norm_out(h_ref)))
+        hs['out'] = h
+        hs['ref_out'] = h_ref
+
+        return hs
+
+class RBADecoder(nn.Module):
+    def __init__(
+            self, ch, out_ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
+            attn_resolutions=16, dropout=0.0, resamp_with_conv=True, in_channels=3,
+            resolution=512, z_channels=256, give_pre_end=False, enable_mid=True,
+            head_size=1, ex_multi_scale_num=0, cross_attn_patch_size=8, **ignorekwargs
+    ):
+        super().__init__()
+        self.ch = ch
+        self.ref_ch = ref_ch
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+        self.resolution = resolution
+        self.in_channels = in_channels
+        self.give_pre_end = give_pre_end
+        self.enable_mid = enable_mid
+        self.ex_multi_scale_num = ex_multi_scale_num
+
+        # compute in_ch_mult, block_in and curr_res at lowest res
+        curr_res = resolution // 2**(self.num_resolutions-1)
+        self.z_shape = (1,z_channels,curr_res,curr_res)
+        print("Working with z of shape {} = {} dimensions.".format(
+            self.z_shape, np.prod(self.z_shape)))
+
+        # z to block_in
+        block_out = ch * ch_mult[-1]
+        self.conv_in = nn.Conv2d(z_channels, block_out, 3, padding=1)
+
+        # middle
+        if self.enable_mid:
+            self.mid = nn.Module()
+            self.mid.block_1 = ResnetBlock(block_out, block_out, dropout=dropout)
+            self.mid.attn_1 = MultiHeadAttnBlock(block_out, head_size)
+            self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
+
+            self.ref_mid = deepcopy(self.mid)
+            self.mid.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
+            self.ref_mid.ref_weight = nn.Parameter(torch.ones(()))
+
+        # upsampling
+        self.up = nn.ModuleList()
+        self.ref_up = nn.ModuleList()
+        for layer_idx, mult in enumerate(reversed(ch_mult)):
+            block_in, block_out = block_out, ch * mult
+            block = [ResnetBlock(block_in, block_out, dropout=dropout)]
+            block += [ResnetBlock(block_out, block_out, dropout=dropout) for _ in range(self.num_res_blocks)]
+            attn = [MultiHeadAttnBlock(block_out, head_size) for _ in range(self.num_res_blocks + 1)] if curr_res in attn_resolutions else []
+            up = nn.Module()
+            up.block = nn.ModuleList(block)
+            up.attn = nn.ModuleList(attn)
+            ref_up = deepcopy(up)
+            if layer_idx != self.num_resolutions - 1:
+                up.upsample = Upsample(block_out, resamp_with_conv)
+                curr_res = curr_res * 2
+            if isinstance(ref_ch, int):
+                up.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
+
+            self.up.append(up)
+            self.ref_up.append(ref_up)
+            self.ref_up.ref_weight = nn.Parameter(torch.ones(()))
+
+        # end
+        self.norm_out = Normalize(block_out, activation='silu')
+        self.conv_out = nn.Conv2d(block_out, out_ch, 3, padding=1)
+
+    def forward(self, z, hs=None, z_ref=None):
+        self.last_z_shape = z.shape
+
+        # timestep embedding
+        temb = None
+
+        # z to block_in
+        h = self.conv_in(z)
+        h_ref = self.conv_in(z_ref)
+
+        # middle
+        if self.enable_mid:
+            h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h, temb)), temb)
+            h_ref = self.ref_mid.block_2(self.ref_mid.attn_1(self.ref_mid.block_1(z_ref, temb)), temb)
+            h = self.mid.cross_attn(h_ref, h)
+
+        # upsampling
+        #for rev_i_level, up_level in enumerate(reversed(self.up)):
+        #for rev_i_level in reversed(range(self.num_resolutions)):
+        for i_level in range(self.num_resolutions):
+            up_level = self.up[i_level]
+            ref_up_level = self.ref_up[i_level]
+            #i_level = self.num_resolutions - rev_i_level - 1
+            for i_block in range(self.num_res_blocks+1):
+                h = up_level.block[i_block](h, temb)
+                h_ref = ref_up_level.block[i_block](h_ref, temb)
+                if len(up_level.attn) > 0:
+                    # outer layers of the decoder do not have multi-scale fusion
+                    if (hs is None) or (i_level >= self.ex_multi_scale_num):
+                        h = up_level.attn[i_block](h)
+                        h_ref = ref_up_level.attn[i_block](h_ref)
+
+                    # inner layers have multi-scale fusion
+                    elif 'block_'+str(i_level)+'_atten' in hs: # at this point hs is defined
+                        h = up_level.attn[i_block](h, hs['block_'+str(i_level)+'_atten'])
+                        h_ref = ref_up_level.attn[i_block](h_ref, hs['block_'+str(i_level)+'_atten'])
+                    else:
+                        h = up_level.attn[i_block](h, hs['block_'+str(i_level)])
+                        h_ref = ref_up_level.attn[i_block](h_ref, hs['block_'+str(i_level)])
+
+                    if z_ref is not None:
+                        h = up_level.cross_attn(h_ref, h)
+            
+            if i_level != self.num_resolutions - 1:
+                h = up_level.upsample(h)
+                h_ref = up_level.upsample(h_ref)
+
+        # end
+        if self.give_pre_end:
+            return h
+
+        h = self.conv_out(nonlinearity(self.norm_out(h)))
+        return h
+
+class RBANet(nn.Module):
     def __init__(
             self,
             n_embed=1024,
@@ -563,22 +864,60 @@ class VQVAEGAN(VQVAEGANMultiHeadTransformer): # VQVAEGANMultiHeadTransformer but
             enable_mid=True,
             fix_decoder=False,
             fix_codebook=True,
+            fix_encoder=False,
             head_size=4,
-            **ignore_kwargs
+            ex_multi_scale_num=1
     ):
-        super(VQVAEGAN, self).__init__(
-            n_embed, embed_dim, ch, out_ch, ref_ch, ch_mult, num_res_blocks,
-            attn_resolutions, dropout, in_channels, resolution,
-            z_channels, double_z, enable_mid, fix_decoder, fix_codebook,
-            False, head_size, 0
-            )
+        super(RBANet, self).__init__()
 
-    def decode(self, quant, x_ref=None):
+        self.encoder = RBAEncoder(ch=ch, out_ch=out_ch, ref_ch=ref_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+                               attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
+                               resolution=resolution, z_channels=z_channels, double_z=double_z, 
+                               enable_mid=enable_mid, head_size=head_size)
+
+        self.quant_conv = nn.Conv2d(z_channels, embed_dim, 1)
+        self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
+        self.post_quant_conv = nn.Conv2d(embed_dim, z_channels, 1)
+
+        #for i in range(ex_multi_scale_num):
+        #        attn_resolutions = [attn_resolutions[0], attn_resolutions[-1]*2]
+        self.decoder = RBADecoder(ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+                               attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
+                               resolution=resolution, z_channels=z_channels, enable_mid=enable_mid, head_size=head_size, ex_multi_scale_num=ex_multi_scale_num)
+
+        if fix_encoder:
+            for _, param in self.encoder.named_parameters():
+                param.requires_grad = False
+            for _, param in self.quant_conv.named_parameters():
+                param.requires_grad = False
+        if fix_codebook:
+            for _, param in self.quantize.named_parameters():
+                param.requires_grad = False
+        elif fix_decoder:
+            for _, param in self.quantize.named_parameters():
+                param.requires_grad = False
+            for _, param in self.post_quant_conv.named_parameters():
+                param.requires_grad = False
+            for _, param in self.decoder.named_parameters():
+                param.requires_grad = False
+	    
+
+    def encode(self, x, x_ref=None):
+        hs = self.encoder(x, x_ref=x_ref)
+        h = self.quant_conv(hs['out'])
+        h_ref = self.quant_conv(hs['ref_out'])
+        quant, emb_loss, info = self.quantize(h)
+        quant_ref, _emb_loss, _info = self.quantize(h_ref)
+        return quant, quant_ref, emb_loss, info, hs
+
+    def decode(self, quant, hs=None, quant_ref=None):
         quant = self.post_quant_conv(quant)
-        dec, penult = self.decoder(quant, x_ref=x_ref)
-        return dec, penult
+        quant_ref = self.post_quant_conv(quant_ref)
+        dec = self.decoder(quant, hs, z_ref=quant_ref)
+        return dec
 
     def forward(self, input, x_ref=None):
-        quant, diff, info, hs = self.encode(input, x_ref=x_ref)
-        dec, penult = self.decode(quant, x_ref=x_ref)
-        return dec, diff, info, hs, penult
+        quant, quant_ref, diff, info, hs = self.encode(input, x_ref=x_ref)
+        dec = self.decode(quant, hs, quant_ref=quant_ref)
+
+        return dec, diff, info, hs

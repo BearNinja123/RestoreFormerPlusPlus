@@ -1,0 +1,7 @@
+gn nn math sdp: OOM
+gn nn flash sdp: 0.6210 it/s, 61156 mib
+gn nn memeff sdp: 0.306 it/s, 61120 mib
+gn flash sdp: 0.727 it/s, 45668 mib
+
+gn nn flash sdp (no contiguous, att): 1.1705 it/s, 57724 mib
+gn flash sdp (no contiguous, att): 1.6476 it/s, 42204 mib

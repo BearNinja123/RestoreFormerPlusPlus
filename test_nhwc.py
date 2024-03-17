@@ -13,7 +13,7 @@ m_ = VQVAEGAN(attn_resolutions=[16], enable_mid=True).to('cuda', dtype=DTYPE)
 #print(sum(p.numel() for p in m_.parameters()))
 x = torch.rand((2, 3, 512, 512), device='cuda', dtype=DTYPE)
 
-BWD = True
+BWD = False
 COMPILE = False
 ctx = nullcontext() if BWD else torch.no_grad()
 comp = lambda m: torch.compile(m,

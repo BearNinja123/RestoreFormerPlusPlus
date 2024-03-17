@@ -46,7 +46,10 @@ class RefDataset(data.Dataset):
                 self.paths = [line.split('.')[0] for line in fin]
         else:
             #self.paths = paths_from_folder(self.gt_folder)
-            self.identity_folders = glob(f'{self.gt_folder}/*')
+            self.identity_folders = []
+            for identity in glob(f'{self.gt_folder}/*'):
+                if len(glob(f'{identity}/*')) > 1:
+                    self.identity_folders.append(identity)
             # self.paths.sort()
 
         # degradations

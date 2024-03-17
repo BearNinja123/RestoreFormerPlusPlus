@@ -141,7 +141,7 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         return out_gray
 
     def forward(self, codebook_loss, gts, reconstructions, components,
-                global_step, last_layer=None, penult=None, split="train"):
+                global_step, last_layer=None, split="train"):
         # now the GAN part
         @torch.compile
         def _p_loss_fn():
