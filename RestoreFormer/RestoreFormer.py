@@ -1,4 +1,4 @@
-import os
+import os, time
 
 import cv2
 import torch
@@ -7,10 +7,9 @@ from facexlib.utils.face_restoration_helper import FaceRestoreHelper
 from torchvision.transforms.functional import normalize
 
 from RestoreFormer.download_util import load_file_from_url
-from RestoreFormer.modules.vqvae.vqvae_arch import VQVAEGANMultiHeadTransformer
+from RestoreFormer.modules.vqvae.vqvae_arch import VQVAEGANMultiHeadTransformer, MEM_FMT
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 
 class RestoreFormer():
     """Helper for restoration with RestoreFormer.
@@ -40,6 +39,9 @@ class RestoreFormer():
             self.RF = VQVAEGANMultiHeadTransformer(head_size = 4, ex_multi_scale_num = 1)
         else:
             raise NotImplementedError(f'Not support arch: {arch}.')
+        #print(self.RF)
+        #print(sum(p.numel() for p in self.RF.parameters()))
+        self.RF = self.RF.to(memory_format=MEM_FMT, dtype=torch.bfloat16)
         
         # initialize face helper
         self.face_helper = FaceRestoreHelper(
@@ -57,7 +59,7 @@ class RestoreFormer():
                 url=model_path, model_dir=os.path.join(ROOT_DIR, 'experiments/weights'), progress=True, file_name=None)
         loadnet = torch.load(model_path)
         
-        strict=False
+        strict=True
         weights = loadnet['state_dict']
         new_weights = {}
         for k, v in weights.items():
@@ -94,10 +96,12 @@ class RestoreFormer():
             # prepare data
             cropped_face_t = img2tensor(cropped_face / 255., bgr2rgb=True, float32=True)
             normalize(cropped_face_t, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True)
-            cropped_face_t = cropped_face_t.unsqueeze(0).to(self.device)
+            cropped_face_t = cropped_face_t.unsqueeze(0).to(self.device, memory_format=MEM_FMT).bfloat16()
 
             try:
+                tic = time.time()
                 output = self.RF(cropped_face_t)[0]
+                print(f'RF++ inference in {time.time() - tic} s')
                 restored_face = tensor2img(output.squeeze(0), rgb2bgr=True, min_max=(-1, 1))
             except RuntimeError as error:
                 print(f'\tFailed inference for RestoreFormer: {error}.')
