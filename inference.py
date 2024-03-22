@@ -114,6 +114,7 @@ def main():
         upscale=args.upscale,
         arch=arch,
         bg_upsampler=bg_upsampler)
+    print('Done loading.')
 
     # ------------------------ input & output ------------------------
     if args.input.endswith('/'):
