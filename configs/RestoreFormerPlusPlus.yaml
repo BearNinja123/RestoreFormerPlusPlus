@@ -20,11 +20,12 @@ model:
         ch: 64
         ch_mult: [1,2,2,4,4,8]  # num_down = len(ch_mult)-1
         num_res_blocks: 2
-        attn_resolutions: [16, 32, 64]
+        attn_resolutions: [16, 32]
         dropout: 0.0
         enable_mid: True
         fix_decoder: False
-        fix_codebook: True
+        #fix_codebook: True
+        fix_codebook: False
         fix_encoder: False
         head_size: 4
         ex_multi_scale_num: 1
@@ -52,7 +53,7 @@ data:
     train:
       target: RestoreFormer.data.ffhq_uneven_degradation_dataset.FFHQUnevenDegradationDataset
       params:
-        #dataroot_gt: /scratch/tnguy231/FFHQ/image512x512
+        dataroot_gt: /scratch/tnguy231/data/ffhq512
         #dataroot_gt: /home/trtx/College/24/zyan/data/CelebHQRef
         io_backend:
           type: disk
