@@ -1,17 +1,13 @@
-import torch
+from RestoreFormer.modules.vqvae.utils import get_roi_regions
+from RestoreFormer.modules.vqvae.vqvae_arch import MEM_FMT
+from main import instantiate_from_config
 import torch.nn.functional as F
 import pytorch_lightning as pl
-from main import instantiate_from_config
-import warnings
-import time, math
+import torch, warnings, time, math
 warnings.filterwarnings('ignore')
-
-from RestoreFormer.modules.vqvae.utils import get_roi_regions
 
 def count_params(module):
     return sum(p.numel() for p in module.parameters())
-
-MEM_FMT = torch.channels_last
 
 class RestoreFormerModel(pl.LightningModule):
     def __init__(self,
@@ -310,7 +306,8 @@ class RBAModel(pl.LightningModule):
         # print(f"Layers without pretraining: {un_pretrained_keys}")
         # print(f'*************************************************')
 
-        self.load_state_dict(state_dict, strict=True)
+        #self.load_state_dict(state_dict, strict=True)
+        self.load_state_dict(state_dict, strict=False)
         print(f"Restored from {path}")
 
     def forward(self, input, ref):

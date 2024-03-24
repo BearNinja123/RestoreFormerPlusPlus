@@ -321,7 +321,7 @@ class CrossAttention(nn.Module):
 
         return x + unpatched_out
 
-class MultiHeadEncoder(nn.Module): # ref_ch = channel count of the reference embedding
+class MultiHeadEncoder(nn.Module):
     def __init__(
             self, ch, ch_mult=(1,2,4,8), num_res_blocks=2,
             attn_resolutions=[16], dropout=0.0, resamp_with_conv=True, in_channels=3,
@@ -595,21 +595,21 @@ class VQVAEGAN(VQVAEGANMultiHeadTransformer): # VQVAEGANMultiHeadTransformer but
         dec = self.decode(quant)
         return dec, diff, info, hs
 
-class RBAEncoder(nn.Module): # ref_ch = channel count of the reference embedding
+class RBAEncoder(nn.Module):
     def __init__(
-            self, ch, ref_ch, ch_mult=(1,2,4,8), num_res_blocks=2,
+            self, ch, ch_mult=(1,2,4,8), num_res_blocks=2,
             attn_resolutions=[16], dropout=0.0, resamp_with_conv=True, in_channels=3,
             resolution=512, z_channels=256, double_z=False, enable_mid=True,
-            head_size=1, cross_attn_patch_size=8, **ignore_kwargs
+            head_size=1, cross_attn_patch_size=8, freeze_base_weights=True, **ignore_kwargs
     ):
         super().__init__()
         self.ch = ch
-        self.ref_ch = ref_ch
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
         self.in_channels = in_channels
         self.enable_mid = enable_mid
+        self.freeze_base_weights = freeze_base_weights
 
         # downsampling
         self.conv_in = nn.Conv2d(in_channels, self.ch, 3, padding=1)
@@ -650,7 +650,12 @@ class RBAEncoder(nn.Module): # ref_ch = channel count of the reference embedding
         self.norm_out = Normalize(block_out, activation='silu')
         self.conv_out = nn.Conv2d(block_out, 2 * z_channels if double_z else z_channels, 3, padding=1)
 
-    def forward(self, x, x_ref=None): # x_ref.shape = (N, ref_ch, H, W)
+        if freeze_base_weights:
+            for module in (self.conv_in, self.down, self.mid, self.norm_out, self.conv_out):
+                for _, param in module.named_parameters():
+                    param.requires_grad = False
+
+    def forward(self, x, x_ref=None): # x_ref.shape = (N, C, H, W)
         hs = {}
         # downsampling
         h = self.conv_in(x)
@@ -697,14 +702,13 @@ class RBAEncoder(nn.Module): # ref_ch = channel count of the reference embedding
 
 class RBADecoder(nn.Module):
     def __init__(
-            self, ch, out_ch, ref_ch=None, ch_mult=(1,2,4,8), num_res_blocks=2,
+            self, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks=2,
             attn_resolutions=16, dropout=0.0, resamp_with_conv=True, in_channels=3,
             resolution=512, z_channels=256, give_pre_end=False, enable_mid=True,
-            head_size=1, ex_multi_scale_num=0, cross_attn_patch_size=8, **ignorekwargs
+            head_size=1, ex_multi_scale_num=0, cross_attn_patch_size=8, freeze_base_weights=True, **ignorekwargs
     ):
         super().__init__()
         self.ch = ch
-        self.ref_ch = ref_ch
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
@@ -712,6 +716,7 @@ class RBADecoder(nn.Module):
         self.give_pre_end = give_pre_end
         self.enable_mid = enable_mid
         self.ex_multi_scale_num = ex_multi_scale_num
+        self.freeze_base_weights = freeze_base_weights
 
         # compute in_ch_mult, block_in and curr_res at lowest res
         curr_res = resolution // 2**(self.num_resolutions-1)
@@ -749,18 +754,22 @@ class RBADecoder(nn.Module):
             if layer_idx != self.num_resolutions - 1:
                 up.upsample = Upsample(block_out, resamp_with_conv)
                 curr_res = curr_res * 2
-            if isinstance(ref_ch, int):
-                up.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
+            up.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
 
-            self.up.append(up)
-            self.ref_up.append(ref_up)
+            self.up.insert(0, up)
+            self.ref_up.insert(0, ref_up)
             self.ref_up.ref_weight = nn.Parameter(torch.ones(()))
 
         # end
         self.norm_out = Normalize(block_out, activation='silu')
         self.conv_out = nn.Conv2d(block_out, out_ch, 3, padding=1)
 
-    def forward(self, z, hs=None, z_ref=None):
+        if freeze_base_weights:
+            for module in (self.conv_in, self.down, self.mid, self.norm_out, self.conv_out):
+                for _, param in module.named_parameters():
+                    param.requires_grad = False
+
+    def forward(self, z, hs, z_ref):
         self.last_z_shape = z.shape
 
         # z to block_in
@@ -769,38 +778,29 @@ class RBADecoder(nn.Module):
 
         # middle
         if self.enable_mid:
-            h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h)))
-            h_ref = self.ref_mid.block_2(self.ref_mid.attn_1(self.ref_mid.block_1(z_ref)))
+            attn_input = hs['mid_atten']
+            h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h), attn_input))
+            h_ref = self.ref_mid.block_2(self.ref_mid.attn_1(self.ref_mid.block_1(z_ref), attn_input))
             h = self.mid.cross_attn(h_ref, h)
 
         # upsampling
-        #for rev_i_level, up_level in enumerate(reversed(self.up)):
-        #for rev_i_level in reversed(range(self.num_resolutions)):
-        for i_level in range(self.num_resolutions):
-            up_level = self.up[i_level]
+        for rev_i_level, up_level in enumerate(reversed(self.up)):
+            i_level = self.num_resolutions - rev_i_level - 1
             ref_up_level = self.ref_up[i_level]
-            #i_level = self.num_resolutions - rev_i_level - 1
             for i_block in range(self.num_res_blocks+1):
                 h = up_level.block[i_block](h)
                 h_ref = ref_up_level.block[i_block](h_ref)
                 if len(up_level.attn) > 0:
-                    # outer layers of the decoder do not have multi-scale fusion
-                    if (hs is None) or (i_level >= self.ex_multi_scale_num):
-                        h = up_level.attn[i_block](h)
-                        h_ref = ref_up_level.attn[i_block](h_ref)
-
-                    # inner layers have multi-scale fusion
-                    elif 'block_'+str(i_level)+'_atten' in hs: # at this point hs is defined
+                    if 'block_'+str(i_level)+'_atten' in hs: # at this point hs is defined
                         h = up_level.attn[i_block](h, hs['block_'+str(i_level)+'_atten'])
                         h_ref = ref_up_level.attn[i_block](h_ref, hs['block_'+str(i_level)+'_atten'])
                     else:
                         h = up_level.attn[i_block](h, hs['block_'+str(i_level)])
                         h_ref = ref_up_level.attn[i_block](h_ref, hs['block_'+str(i_level)])
 
-                    if z_ref is not None:
-                        h = up_level.cross_attn(h_ref, h)
+                    h = up_level.cross_attn(h_ref, h)
             
-            if i_level != self.num_resolutions - 1:
+            if i_level != 0:
                 h = up_level.upsample(h)
                 h_ref = up_level.upsample(h_ref)
 
@@ -818,7 +818,6 @@ class RBANet(nn.Module):
             embed_dim=256,
             ch=64,
             out_ch=3,
-            ref_ch=None,
             ch_mult=(1, 2, 2, 4, 4, 8),
             num_res_blocks=2,
             attn_resolutions=(16, ),
@@ -832,40 +831,38 @@ class RBANet(nn.Module):
             fix_codebook=True,
             fix_encoder=False,
             head_size=4,
-            ex_multi_scale_num=1
+            ex_multi_scale_num=1,
+            freeze_base_weights=True,
     ):
         super(RBANet, self).__init__()
 
-        self.encoder = RBAEncoder(ch=ch, out_ch=out_ch, ref_ch=ref_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+        self.encoder = RBAEncoder(ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
                                resolution=resolution, z_channels=z_channels, double_z=double_z, 
-                               enable_mid=enable_mid, head_size=head_size)
+                               enable_mid=enable_mid, head_size=head_size, freeze_base_weights=freeze_base_weights)
 
         self.quant_conv = nn.Conv2d(z_channels, embed_dim, 1)
         self.quantize = VectorQuantizer(n_embed, embed_dim, beta=0.25)
         self.post_quant_conv = nn.Conv2d(embed_dim, z_channels, 1)
 
-        #for i in range(ex_multi_scale_num):
-        #        attn_resolutions = [attn_resolutions[0], attn_resolutions[-1]*2]
+        for i in range(ex_multi_scale_num):
+                attn_resolutions = [attn_resolutions[0], attn_resolutions[-1]*2]
         self.decoder = RBADecoder(ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
-                               resolution=resolution, z_channels=z_channels, enable_mid=enable_mid, head_size=head_size, ex_multi_scale_num=ex_multi_scale_num)
+                               resolution=resolution, z_channels=z_channels, enable_mid=enable_mid, head_size=head_size,
+                               ex_multi_scale_num=ex_multi_scale_num, freeze_base_weights=freeze_base_weights)
 
         if fix_encoder:
-            for _, param in self.encoder.named_parameters():
-                param.requires_grad = False
-            for _, param in self.quant_conv.named_parameters():
-                param.requires_grad = False
+            for module in (self.encoder, self.quant_conv):
+                for _, param in module.named_parameters():
+                    param.requires_grad = False
         if fix_codebook:
             for _, param in self.quantize.named_parameters():
                 param.requires_grad = False
         elif fix_decoder:
-            for _, param in self.quantize.named_parameters():
-                param.requires_grad = False
-            for _, param in self.post_quant_conv.named_parameters():
-                param.requires_grad = False
-            for _, param in self.decoder.named_parameters():
-                param.requires_grad = False
+            for module in (self.quantize, self.post_quant_conv, self.decoder):
+                for _, param in module.named_parameters():
+                    param.requires_grad = False
 	    
 
     def encode(self, x, x_ref=None):

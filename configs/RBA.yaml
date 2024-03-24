@@ -8,7 +8,7 @@ model:
     comp_params_lr_scale: 10
     schedule_step: [4000000, 8000000]
     ddconfig:
-      target: RestoreFormer.modules.vqvae.vqvae_arch.VQVAEGANMultiHeadTransformer
+      target: RestoreFormer.modules.vqvae.vqvae_arch.RBANet
       params:
         embed_dim: 512
         n_embed: 4096
