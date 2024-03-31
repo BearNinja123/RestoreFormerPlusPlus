@@ -276,14 +276,18 @@ class CrossAttention(nn.Module):
         assert((patch_size * in_channels) % head_size == 0), 'The size of head should be divided by the number of channels.'
         y_ch = in_channels if y_channels is None else y_channels
 
-        self.norm1 = Normalize(in_channels * patch_size * patch_size)
+        self.norm1 = Normalize(in_channels)
         if y_channels is not None:
-            self.norm2 = Normalize(y_ch * patch_size * patch_size)
+            self.norm2 = Normalize(y_ch)
 
-        self.q = nn.Conv2d(y_ch * patch_size * patch_size, in_channels, 1) # kinda strange how the y (cross attention input) goes into the query but this is how RF++ does it
-        self.k = nn.Conv2d(in_channels * patch_size * patch_size, in_channels, 1)
-        self.v = nn.Conv2d(in_channels * patch_size * patch_size, in_channels, 1)
-        self.proj_out = nn.Conv2d(in_channels, in_channels * patch_size * patch_size, 1)
+        #self.q = nn.Conv2d(y_ch * patch_size * patch_size, in_channels, 1) # kinda strange how the y (cross attention input) goes into the query but this is how RF++ does it
+        #self.k = nn.Conv2d(in_channels * patch_size * patch_size, in_channels, 1)
+        #self.v = nn.Conv2d(in_channels * patch_size * patch_size, in_channels, 1)
+        # TODO: experiment with groups (maybe dwise conv isn't the way?)
+        self.q = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=in_channels) # kinda strange how the y (cross attention input) goes into the query but this is how RF++ does it
+        self.k = nn.Conv2d(in_channels, in_channels, patch_size, stride=patch_size, groups=in_channels)
+        self.v = nn.Conv2d(in_channels, in_channels, patch_size, stride=patch_size, groups=in_channels)
+        self.proj_out = nn.Conv2d(in_channels, in_channels * patch_size * patch_size, 1, groups=in_channels)
 
     def split_heads(self, x):
         B, _C, H, W = x.shape
@@ -304,22 +308,17 @@ class CrossAttention(nn.Module):
     
     def forward(self, x, y):
         B, C, H, W = x.shape
-        x_patched = x.view(B, C, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size)
-        x_flattened = x_patched.permute(0, 1, 3, 5, 2, 4).flatten(start_dim=1, end_dim=3)
-        y_patched = y.view(B, C, H // self.patch_size, self.patch_size, W // self.patch_size, self.patch_size)
-        y_flattened = y_patched.permute(0, 1, 3, 5, 2, 4).flatten(start_dim=1, end_dim=3)
 
-        kv = self.norm1(x_flattened)
-        q = kv if y is None else self.norm2(y_flattened)
+        kv = self.norm1(x)
+        q = kv if y is None else self.norm2(y)
         q, k, v = map(self.split_heads, (self.q(q), self.k(kv), self.v(kv)))
 
         # compute attention
         att = F.scaled_dot_product_attention(q, k, v)
         catted = att.transpose(2, 3).reshape(B, C, H // self.patch_size, W // self.patch_size) #.contiguous(memory_format=MEM_FMT) # M H N D -> M H D N -> B C H W
-        patched_out = self.proj_out(catted)
-        unpatched_out = patched_out.view(B, C, self.patch_size, self.patch_size, H // self.patch_size, W // self.patch_size).permute(0, 1, 4, 2, 5, 3).reshape(B, C, H, W)
+        out = F.pixel_shuffle(self.proj_out(catted), self.patch_size)
 
-        return x + unpatched_out
+        return x + out
 
 class MultiHeadEncoder(nn.Module):
     def __init__(
