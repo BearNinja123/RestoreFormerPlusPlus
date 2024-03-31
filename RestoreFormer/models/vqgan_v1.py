@@ -377,8 +377,9 @@ class RBAModel(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         #x = (batch[self.image_key] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
-        x = batch[self.image_key]
-        xrec, qloss, _info, _hs = self(x)
+        x = batch[self.image_key].to(self.device)
+        ref = batch['ref'].to(self.device)
+        xrec, qloss, _info, _hs = self(x, ref)
 
         if self.image_key != 'gt':
             #x = (batch['gt'] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]
@@ -445,9 +446,11 @@ class RBAModel(pl.LightningModule):
         self.vqvae.eval()
         log = dict()
         x = batch[self.image_key].to(self.device)
-        xrec, _qloss, _info, _hs = self(x)
+        ref = batch['ref'].to(self.device)
+        xrec, _qloss, _info, _hs = self(x, ref)
         self.vqvae.train()
         log["inputs"] = x
+        log["references"] = ref
         log["reconstructions"] = xrec
 
         if self.image_key != 'gt':

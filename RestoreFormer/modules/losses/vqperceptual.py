@@ -167,7 +167,7 @@ class VQLPIPSWithDiscriminatorWithCompWithIdentity(nn.Module):
         try:
             d_weight = self.calculate_adaptive_weight(nll_loss, g_loss, last_layer=last_layer)
         except RuntimeError as e:
-            print(e)
+            print('Error calculating adaptive weight from RestoreFormer/modules/losses/vqperceptual.py:', e)
             assert not self.training
             d_weight = torch.tensor(0.0)
 

@@ -1,24 +1,24 @@
-import os
-import cv2
-import math
-import numpy as np
-import random
-import os.path as osp
-import torch
-import torch.utils.data as data
-from torchvision.transforms.functional import (adjust_brightness, adjust_contrast, adjust_hue, adjust_saturation,
-                                               normalize)
-
+from torchvision.transforms.functional import (
+        adjust_brightness, adjust_contrast,
+        adjust_hue, adjust_saturation, normalize)
+from basicsr.utils import (
+        FileClient, get_root_logger, imfrombytes,
+        img2tensor, imwrite, tensor2img)
 from basicsr.data import degradations as degradations
 from basicsr.data.data_util import paths_from_folder
-from basicsr.data.transforms import augment
-from basicsr.utils import FileClient, get_root_logger, imfrombytes, img2tensor
 from basicsr.utils.registry import DATASET_REGISTRY
+from basicsr.data.transforms import augment
+from omegaconf import OmegaConf
 from glob import glob
+
+import torch.utils.data as data
+import os.path as osp
+import numpy as np
+import torch, cv2
+import math, os, random, argparse, pdb
 
 @DATASET_REGISTRY.register()
 class RefDataset(data.Dataset):
-
     def __init__(self, opt):
         super(RefDataset, self).__init__()
         self.opt = opt
@@ -39,11 +39,11 @@ class RefDataset(data.Dataset):
 
         if self.io_backend_opt['type'] == 'lmdb':
             raise NotImplementedError()
-            self.io_backend_opt['db_paths'] = self.gt_folder
-            if not self.gt_folder.endswith('.lmdb'):
-                raise ValueError(f"'dataroot_gt' should end with '.lmdb', but received {self.gt_folder}")
-            with open(osp.join(self.gt_folder, 'meta_info.txt')) as fin:
-                self.paths = [line.split('.')[0] for line in fin]
+            #self.io_backend_opt['db_paths'] = self.gt_folder
+            #if not self.gt_folder.endswith('.lmdb'):
+            #    raise ValueError(f"'dataroot_gt' should end with '.lmdb', but received {self.gt_folder}")
+            #with open(osp.join(self.gt_folder, 'meta_info.txt')) as fin:
+            #    self.paths = [line.split('.')[0] for line in fin]
         else:
             #self.paths = paths_from_folder(self.gt_folder)
             self.identity_folders = []
@@ -96,6 +96,7 @@ class RefDataset(data.Dataset):
         self.shift_prob = opt.get('shift_prob', 0.)
         self.shift_unit = opt.get('shift_unit', 32)
         self.shift_max_num = opt.get('shift_max_num', 3)
+        self.img_size = opt.get('img_size', (512, 512))
 
     @staticmethod
     def color_jitter(img, shift):
@@ -161,10 +162,14 @@ class RefDataset(data.Dataset):
         img_gt = imfrombytes(img_bytes, float32=True)
         img_bytes = self.file_client.get(ref_path)
         img_ref = imfrombytes(img_bytes, float32=True)
+        if img_ref.shape != self.img_size:
+            img_ref = cv2.resize(img_ref, self.img_size)
 
         # random horizontal flip
         img_gt, status = augment(img_gt, hflip=self.opt['use_hflip'], rotation=False, return_status=True)
         img_ref, status = augment(img_ref, hflip=self.opt['use_hflip'], rotation=False, return_status=True)
+        if img_gt.shape != self.img_size:
+            img_gt = cv2.resize(img_gt, self.img_size)
         h, w, _ = img_gt.shape
 
         if self.get_mask:
@@ -340,12 +345,6 @@ class RefDataset(data.Dataset):
     def __len__(self):
         #return len(self.paths)
         return len(self.identity_folders)
-
-import argparse
-from omegaconf import OmegaConf
-import pdb
-from basicsr.utils import img2tensor, imwrite, tensor2img
-# from taming.modules.vqvae.utils import get_roi_regions
 
 if __name__=='__main__':
     # pdb.set_trace()

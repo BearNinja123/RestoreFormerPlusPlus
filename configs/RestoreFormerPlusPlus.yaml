@@ -24,7 +24,6 @@ model:
         dropout: 0.0
         enable_mid: True
         fix_decoder: False
-        #fix_codebook: True
         fix_codebook: False
         fix_encoder: False
         head_size: 4
@@ -54,7 +53,6 @@ data:
       target: RestoreFormer.data.ffhq_uneven_degradation_dataset.FFHQUnevenDegradationDataset
       params:
         dataroot_gt: /scratch/tnguy231/data/ffhq512
-        #dataroot_gt: /home/trtx/College/24/zyan/data/CelebHQRef
         io_backend:
           type: disk
         use_hflip: True
@@ -94,48 +92,48 @@ data:
         eye_enlarge_ratio: 1.4
 
 
-    validation:
-      target: RestoreFormer.data.ffhq_degradation_dataset.FFHQDegradationDataset
-      params:
-        dataroot_gt: /scratch/tnguy231/FFHQ/image512x512
-        io_backend:
-          type: disk
-        use_hflip: False
-        mean: [0.5, 0.5, 0.5]
-        std: [0.5, 0.5, 0.5]
-        out_size: 512
+        #validation:
+        #  target: RestoreFormer.data.ffhq_degradation_dataset.FFHQDegradationDataset
+        #  params:
+        #    dataroot_gt: /scratch/tnguy231/FFHQ/image512x512
+        #    io_backend:
+        #      type: disk
+        #    use_hflip: False
+        #    mean: [0.5, 0.5, 0.5]
+        #    std: [0.5, 0.5, 0.5]
+        #    out_size: 512
 
-        blur_kernel_size: [19,20]
-        kernel_list: ['iso', 'aniso']
-        kernel_prob: [0.5, 0.5]
-        blur_sigma: [0.1, 10]
-        downsample_range: [0.8, 8]
-        noise_range: [0, 20]
-        jpeg_range: [60, 100]
+        #    blur_kernel_size: [19,20]
+        #    kernel_list: ['iso', 'aniso']
+        #    kernel_prob: [0.5, 0.5]
+        #    blur_sigma: [0.1, 10]
+        #    downsample_range: [0.8, 8]
+        #    noise_range: [0, 20]
+        #    jpeg_range: [60, 100]
 
-        # color jitter and gray
-        color_jitter_prob: ~
-        color_jitter_shift: 20
-        color_jitter_pt_prob: ~
-        
-        gray_prob: ~
-        gt_gray: True
+        #    # color jitter and gray
+        #    color_jitter_prob: ~
+        #    color_jitter_shift: 20
+        #    color_jitter_pt_prob: ~
+        #    
+        #    gray_prob: ~
+        #    gt_gray: True
 
-        exposure_prob: ~
-        exposure_range: [0.7, 1.1]
-        
-        shift_prob: ~
-        shift_unit: 1
-        shift_max_num: 32
+        #    exposure_prob: ~
+        #    exposure_range: [0.7, 1.1]
+        #    
+        #    shift_prob: ~
+        #    shift_unit: 1
+        #    shift_max_num: 32
 
-        uneven_prob: ~
-        
-        hazy_prob: ~
-        hazy_alpha: [0.75, 0.95]
+        #    uneven_prob: ~
+        #    
+        #    hazy_prob: ~
+        #    hazy_alpha: [0.75, 0.95]
 
-        crop_components: False
-        component_path: /scratch/tnguy231/RFExperiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
-        eye_enlarge_ratio: 1.4
+        #    crop_components: False
+        #    component_path: /scratch/tnguy231/RFExperiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
+        #    eye_enlarge_ratio: 1.4
 
 lightning:
   trainer:

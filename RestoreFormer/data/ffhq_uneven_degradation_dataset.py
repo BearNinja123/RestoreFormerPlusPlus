@@ -18,7 +18,6 @@ from basicsr.utils.registry import DATASET_REGISTRY
 
 @DATASET_REGISTRY.register()
 class FFHQUnevenDegradationDataset(data.Dataset):
-
     def __init__(self, opt):
         super(FFHQUnevenDegradationDataset, self).__init__()
         self.opt = opt

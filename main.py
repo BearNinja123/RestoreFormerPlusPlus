@@ -158,7 +158,8 @@ def instantiate_from_config(config):
     if 'basicsr.data' in config["target"] or \
         'FFHQDegradationDataset' in config["target"] or \
         'FFHQAugDataset' in config["target"] or \
-        'FFHQUnevenDegradationDataset' in config["target"]:
+        'FFHQUnevenDegradationDataset' in config["target"] or \
+        'RefDataset' in config["target"]:
         return get_obj_from_str(config["target"])(config.get("params", dict()))
     return get_obj_from_str(config["target"])(**config.get("params", dict()))
 

@@ -18,9 +18,9 @@ model:
         in_channels: 3  
         out_ch: 3
         ch: 64
-        ch_mult: [1,2,2,2,4,4]  # num_down = len(ch_mult)-1
+        ch_mult: [1,2,2,4,4,8]  # num_down = len(ch_mult)-1
         num_res_blocks: 2
-        attn_resolutions: [16, 32, 64]
+        attn_resolutions: [16, 32]
         dropout: 0.0
         enable_mid: True
         fix_decoder: False
@@ -28,27 +28,6 @@ model:
         fix_encoder: False
         head_size: 4
         ex_multi_scale_num: 1
-
-    #refencoderconfig:
-    #  target: RestoreFormer.modules.vqvae.vqvae_arch.MultiHeadEncoder
-    #  params:
-    #    embed_dim: 512
-    #    n_embed: 4096
-    #    double_z: False
-    #    z_channels: 512
-    #    resolution: 512
-    #    in_channels: 3  
-    #    out_ch: 3
-    #    ch: 64
-    #    ch_mult: [1,2,4,8]  # num_down = len(ch_mult)-1
-    #    num_res_blocks: 2
-    #    attn_resolutions: []
-    #    dropout: 0.0
-    #    enable_mid: True
-    #    fix_decoder: False
-    #    fix_codebook: False
-    #    fix_encoder: False
-
 
     lossconfig:
       target: RestoreFormer.modules.losses.vqperceptual.VQLPIPSWithDiscriminatorWithCompWithIdentity
@@ -68,13 +47,12 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 16 # per device
+    batch_size: 4 # per device
     num_workers: 7
     train:
       target: RestoreFormer.data.ref_dataset.RefDataset
       params:
-        #dataroot_gt: /scratch/tnguy231/FFHQ/image512x512
-        dataroot_gt: /home/trtx/College/24/zyan/data/CelebHQRef
+        dataroot_gt: /scratch/tnguy231/data/CelebHQRefForRelease
         io_backend:
           type: disk
         use_hflip: True
@@ -90,14 +68,14 @@ data:
         noise_range: [0, 20]
         jpeg_range: [60, 100]
 
-        color_jitter_prob: ~
+        #color_jitter_prob: ~
         color_jitter_shift: 20
-        color_jitter_pt_prob: ~
+        #color_jitter_pt_prob: ~
 
         gray_prob: 0.008
         gt_gray: True
 
-        exposure_prob: ~
+        #exposure_prob: ~
         exposure_range: [0.7, 1.1]
         
         shift_prob: 0.2
@@ -109,54 +87,58 @@ data:
         hazy_prob: 0.008
         hazy_alpha: [0.75, 0.95]
 
-        crop_components: False
-        component_path: /scratch/tnguy231/RFExperiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
-        eye_enlarge_ratio: 1.4
-
-
-    validation:
-      target: RestoreFormer.data.ref_dataset.RefDataset
-      params:
-        #dataroot_gt: /scratch/tnguy231/FFHQ/image512x512
-        dataroot_gt: /home/trtx/College/24/zyan/data/lfw
-        io_backend:
-          type: disk
-        use_hflip: False
-        mean: [0.5, 0.5, 0.5]
-        std: [0.5, 0.5, 0.5]
-        out_size: 512
-
-        blur_kernel_size: [19,20]
-        kernel_list: ['iso', 'aniso']
-        kernel_prob: [0.5, 0.5]
-        blur_sigma: [0.1, 10]
-        downsample_range: [0.8, 8]
-        noise_range: [0, 20]
-        jpeg_range: [60, 100]
-
-        # color jitter and gray
-        color_jitter_prob: ~
-        color_jitter_shift: 20
-        color_jitter_pt_prob: ~
-        
-        gray_prob: ~
-        gt_gray: True
-
-        exposure_prob: ~
-        exposure_range: [0.7, 1.1]
-        
-        shift_prob: ~
-        shift_unit: 1
-        shift_max_num: 32
-
-        uneven_prob: ~
-        
-        hazy_prob: ~
-        hazy_alpha: [0.75, 0.95]
+        #img_size: [512, 512]
 
         crop_components: False
         component_path: /scratch/tnguy231/RFExperiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
         eye_enlarge_ratio: 1.4
+
+
+        #validation:
+        #  target: RestoreFormer.data.ref_dataset.RefDataset
+        #  params:
+        #    #dataroot_gt: /scratch/tnguy231/data/lfw
+        #    dataroot_gt: /scratch/tnguy231/data/CelebHQRefForRelease
+        #    io_backend:
+        #      type: disk
+        #    use_hflip: False
+        #    mean: [0.5, 0.5, 0.5]
+        #    std: [0.5, 0.5, 0.5]
+        #    out_size: 512
+
+        #    blur_kernel_size: [19,20]
+        #    kernel_list: ['iso', 'aniso']
+        #    kernel_prob: [0.5, 0.5]
+        #    blur_sigma: [0.1, 10]
+        #    downsample_range: [0.8, 8]
+        #    noise_range: [0, 20]
+        #    jpeg_range: [60, 100]
+
+        #    # color jitter and gray
+        #    #color_jitter_prob: ~
+        #    color_jitter_shift: 20
+        #    #color_jitter_pt_prob: ~
+        #    
+        #    #gray_prob: ~
+        #    gt_gray: True
+
+        #    #exposure_prob: ~
+        #    exposure_range: [0.7, 1.1]
+        #    
+        #    shift_prob: ~
+        #    shift_unit: 1
+        #    shift_max_num: 32
+
+        #    #uneven_prob: ~
+        #    
+        #    #hazy_prob: ~
+        #    hazy_alpha: [0.75, 0.95]
+
+        #    #img_size: [512, 512]
+
+        #    crop_components: False
+        #    component_path: /scratch/tnguy231/RFExperiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
+        #    eye_enlarge_ratio: 1.4
 
 lightning:
   trainer:

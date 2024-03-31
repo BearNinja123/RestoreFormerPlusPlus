@@ -600,7 +600,7 @@ class RBAEncoder(nn.Module):
             self, ch, ch_mult=(1,2,4,8), num_res_blocks=2,
             attn_resolutions=[16], dropout=0.0, resamp_with_conv=True, in_channels=3,
             resolution=512, z_channels=256, double_z=False, enable_mid=True,
-            head_size=1, cross_attn_patch_size=8, freeze_base_weights=True, **ignore_kwargs
+            head_size=1, cross_attn_patch_size=8, freeze_base_weights=False, **ignore_kwargs
     ):
         super().__init__()
         self.ch = ch
@@ -631,7 +631,6 @@ class RBAEncoder(nn.Module):
                 curr_res = curr_res // 2
             ref_down = deepcopy(down)
             down.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
-            self.ref_down.ref_weight = nn.Parameter(torch.ones(()))
 
             self.down.append(down)
             self.ref_down.append(ref_down)
@@ -644,7 +643,6 @@ class RBAEncoder(nn.Module):
             self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
             self.ref_mid = deepcopy(self.mid)
             self.mid.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
-            self.ref_mid.ref_weight = nn.Parameter(torch.ones(()))
 
         # end
         self.norm_out = Normalize(block_out, activation='silu')
@@ -669,7 +667,7 @@ class RBAEncoder(nn.Module):
                 h_ref = ref_level.block[i_block](h_ref)
                 if len(level.attn) > 0:
                     h = level.attn[i_block](h)
-                    h_ref = ref_level.ref_weight * ref_level.attn[i_block](h_ref)
+                    h_ref = ref_level.attn[i_block](h_ref)
                 if x_ref is not None:
                     h = level.cross_attn(h_ref, h) # h_ref is K/V, h is Q
 
@@ -688,7 +686,7 @@ class RBAEncoder(nn.Module):
             h_ref = self.ref_mid.block_1(h_ref)
             hs['block_'+str(i_level)+'_atten'] = h_ref
             h_ref = self.ref_mid.attn_1(h_ref)
-            h_ref = self.ref_mid.ref_weight * self.ref_mid.block_2(h_ref)
+            h_ref = self.ref_mid.block_2(h_ref)
             h = self.mid.cross_attn(h_ref, h)
             hs['mid_atten'] = h
 
@@ -705,7 +703,7 @@ class RBADecoder(nn.Module):
             self, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks=2,
             attn_resolutions=16, dropout=0.0, resamp_with_conv=True, in_channels=3,
             resolution=512, z_channels=256, give_pre_end=False, enable_mid=True,
-            head_size=1, ex_multi_scale_num=0, cross_attn_patch_size=8, freeze_base_weights=True, **ignorekwargs
+            head_size=1, ex_multi_scale_num=0, cross_attn_patch_size=8, freeze_base_weights=False, **ignorekwargs
     ):
         super().__init__()
         self.ch = ch
@@ -737,7 +735,6 @@ class RBADecoder(nn.Module):
 
             self.ref_mid = deepcopy(self.mid)
             self.mid.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
-            self.ref_mid.ref_weight = nn.Parameter(torch.ones(()))
 
         # upsampling
         self.up = nn.ModuleList()
@@ -758,14 +755,13 @@ class RBADecoder(nn.Module):
 
             self.up.insert(0, up)
             self.ref_up.insert(0, ref_up)
-            self.ref_up.ref_weight = nn.Parameter(torch.ones(()))
 
         # end
         self.norm_out = Normalize(block_out, activation='silu')
         self.conv_out = nn.Conv2d(block_out, out_ch, 3, padding=1)
 
         if freeze_base_weights:
-            for module in (self.conv_in, self.down, self.mid, self.norm_out, self.conv_out):
+            for module in (self.conv_in, self.up, self.mid, self.norm_out, self.conv_out):
                 for _, param in module.named_parameters():
                     param.requires_grad = False
 
@@ -780,7 +776,7 @@ class RBADecoder(nn.Module):
         if self.enable_mid:
             attn_input = hs['mid_atten']
             h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h), attn_input))
-            h_ref = self.ref_mid.block_2(self.ref_mid.attn_1(self.ref_mid.block_1(z_ref), attn_input))
+            h_ref = self.ref_mid.block_2(self.ref_mid.attn_1(self.ref_mid.block_1(h_ref), attn_input))
             h = self.mid.cross_attn(h_ref, h)
 
         # upsampling
@@ -832,7 +828,7 @@ class RBANet(nn.Module):
             fix_encoder=False,
             head_size=4,
             ex_multi_scale_num=1,
-            freeze_base_weights=True,
+            freeze_base_weights=False,
     ):
         super(RBANet, self).__init__()
 
@@ -863,6 +859,7 @@ class RBANet(nn.Module):
             for module in (self.quantize, self.post_quant_conv, self.decoder):
                 for _, param in module.named_parameters():
                     param.requires_grad = False
+        print('vqvae_arch.py L868', self)
 	    
 
     def encode(self, x, x_ref=None):
