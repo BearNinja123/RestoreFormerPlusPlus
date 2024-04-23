@@ -3,7 +3,7 @@ model:
   target: RestoreFormer.models.vqgan_v1.RestoreFormerModel
   params:
     image_key: 'gt'
-    #ckpt_path: /scratch/tnguy231/RFExperiments/tnguy231/logs/2024-02-21T02-10-12_ROHQDROHQD_gpus1_seed91/checkpoints/last.ckpt
+    ckpt_path: /scratch/tnguy231/RF++/experiments/logs/2024-04-22T01-22-58_RA_VQVAE_gpus2_seed83/checkpoints/last.ckpt
     schedule_step: [100000, 200000]
     # ignore_keys: ['vqvae.quantize.utility_counter']
     ddconfig:
@@ -17,8 +17,8 @@ model:
         in_channels: 3
         out_ch: 3
         ch: 32
-        ch_mult: [1,2,2,4,4,8]  # num_down = len(ch_mult)-1
-        attn_resolutions: [16, 32, 64]
+        ch_mult: [1,2,4,8]  # num_down = len(ch_mult)-1
+        attn_resolutions: []
         num_res_blocks: 2
         dropout: 0.0
         enable_mid: True
@@ -32,11 +32,11 @@ model:
         disc_conditional: False
         disc_in_channels: 3
         disc_start: 10001
-        disc_weight: 1.0
+        disc_weight: 3.0
         codebook_weight: 1.0
         identity_weight: 1.5
         use_actnorm: False
-        identity_model_path: /scratch/tnguy231/RFExperiments/pretrained_models/arcface_resnet18.pth
+        identity_model_path: /scratch/tnguy231/RF++/experiments/pretrained_models/arcface_resnet18.pth
 
 data:
   target: main.DataModuleFromConfig

@@ -4,23 +4,24 @@ model:
   params:
     image_key: 'lq'
     #ckpt_path: '/scratch/tnguy231/RFExperiments/tnguy231/logs/2024-01-06T13-50-41_ROHQDROHQD_gpus1_seed26/checkpoints/epoch=000079.ckpt'
+    ckpt_path: '/scratch/tnguy231/RF++/experiments/weights/RestoreFormer++.ckpt'
     special_params_lr_scale: 10
     comp_params_lr_scale: 10
     schedule_step: [4000000, 8000000]
     ddconfig:
       target: RestoreFormer.modules.vqvae.vqvae_arch.VQVAEGANMultiHeadTransformer
       params:
-        embed_dim: 512
-        n_embed: 4096
+        embed_dim: 256
+        n_embed: 1024
         double_z: False
-        z_channels: 512
+        z_channels: 256
         resolution: 512
         in_channels: 3  
         out_ch: 3
         ch: 64
         ch_mult: [1,2,2,4,4,8]  # num_down = len(ch_mult)-1
         num_res_blocks: 2
-        attn_resolutions: [16, 32]
+        attn_resolutions: [16]
         dropout: 0.0
         enable_mid: True
         fix_decoder: False
@@ -42,7 +43,7 @@ model:
         #comp_weight: [1.0, 1.0, 1.0, 0]
         #comp_weight: 1.0
         #comp_style_weight: 0.0
-        identity_model_path: /scratch/tnguy231/RFExperiments/pretrained_models/arcface_resnet18.pth
+        identity_model_path: /scratch/tnguy231/RF++/experiments/pretrained_models/arcface_resnet18.pth
 
 data:
   target: main.DataModuleFromConfig
@@ -88,7 +89,7 @@ data:
         hazy_alpha: [0.75, 0.95]
 
         crop_components: False
-        component_path: /scratch/tnguy231/RFExperiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
+        component_path: /scratch/tnguy231/RF++/experiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
         eye_enlarge_ratio: 1.4
 
 

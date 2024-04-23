@@ -88,8 +88,8 @@ class RestoreFormer():
             # eye_dist_threshold=5: skip faces whose eye distance is smaller than 5 pixels
             # TODO: even with eye_dist_threshold, it will still introduce wrong detections and restorations.
             # align and warp each face
-            #self.face_helper.align_warp_face()
-            self.face_helper.align_warp_face(input_imgs=(None if ref_img is None else img))
+            self.face_helper.align_warp_face()
+            #self.face_helper.align_warp_face(input_imgs=(None if ref_img is None else img))
 
         # face restoration
         for cropped_face in self.face_helper.cropped_faces:

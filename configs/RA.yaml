@@ -1,26 +1,26 @@
 model:
   base_learning_rate: 4.5e-6 
-  target: RestoreFormer.models.vqgan_v1.RBAModel
+  target: RestoreFormer.models.vqgan_v1.RAModel
   params:
     image_key: 'lq'
-    #ckpt_path: '/scratch/tnguy231/RFExperiments/tnguy231/logs/2024-01-06T13-50-41_ROHQDROHQD_gpus1_seed26/checkpoints/epoch=000079.ckpt'
+    ckpt_path: '/scratch/tnguy231/RF++/experiments/weights/RestoreFormer++.ckpt'
     special_params_lr_scale: 10
     comp_params_lr_scale: 10
     schedule_step: [4000000, 8000000]
     ddconfig:
-      target: RestoreFormer.modules.vqvae.vqvae_arch.RBANet
+      target: RestoreFormer.modules.vqvae.vqvae_arch.RANet
       params:
-        embed_dim: 512
-        n_embed: 4096
+        embed_dim: 256
+        n_embed: 1024
         double_z: False
-        z_channels: 512
+        z_channels: 256
         resolution: 512
         in_channels: 3  
         out_ch: 3
         ch: 64
         ch_mult: [1,2,2,4,4,8]  # num_down = len(ch_mult)-1
         num_res_blocks: 2
-        attn_resolutions: [16, 32]
+        attn_resolutions: [16]
         dropout: 0.0
         enable_mid: True
         fix_decoder: False
@@ -34,7 +34,8 @@ model:
       params:
         disc_conditional: False
         disc_in_channels: 3
-        disc_start: 10001
+        #disc_start: 10001
+        disc_start: 0
         disc_weight: 1.0
         codebook_weight: 1.0
         identity_weight: 1.5
@@ -42,17 +43,17 @@ model:
         #comp_weight: [1.0, 1.0, 1.0, 0]
         #comp_weight: 1.0
         #comp_style_weight: 0.0
-        identity_model_path: /scratch/tnguy231/RFExperiments/pretrained_models/arcface_resnet18.pth
+        identity_model_path: /scratch/tnguy231/RF++/experiments/pretrained_models/arcface_resnet18.pth
 
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 4 # per device
+    batch_size: 16 # per device
     num_workers: 7
     train:
       target: RestoreFormer.data.ref_dataset.RefDataset
       params:
-        dataroot_gt: /scratch/tnguy231/data/CelebHQRefForRelease
+        dataroot_gt: /scratch/tnguy231/data/CelebHQRefForRelease/train
         io_backend:
           type: disk
         use_hflip: True
@@ -90,55 +91,53 @@ data:
         #img_size: [512, 512]
 
         crop_components: False
-        component_path: /scratch/tnguy231/RFExperiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
+        component_path: /scratch/tnguy231/RF++/experiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
         eye_enlarge_ratio: 1.4
 
+    validation:
+      target: RestoreFormer.data.ref_dataset.RefDataset
+      params:
+        dataroot_gt: /scratch/tnguy231/data/CelebHQRefForRelease/valid
+        io_backend:
+          type: disk
+        use_hflip: False
+        mean: [0.5, 0.5, 0.5]
+        std: [0.5, 0.5, 0.5]
+        out_size: 512
 
-        #validation:
-        #  target: RestoreFormer.data.ref_dataset.RefDataset
-        #  params:
-        #    #dataroot_gt: /scratch/tnguy231/data/lfw
-        #    dataroot_gt: /scratch/tnguy231/data/CelebHQRefForRelease
-        #    io_backend:
-        #      type: disk
-        #    use_hflip: False
-        #    mean: [0.5, 0.5, 0.5]
-        #    std: [0.5, 0.5, 0.5]
-        #    out_size: 512
+        blur_kernel_size: [19,20]
+        kernel_list: ['iso', 'aniso']
+        kernel_prob: [0.5, 0.5]
+        blur_sigma: [0.1, 10]
+        downsample_range: [0.8, 8]
+        noise_range: [0, 20]
+        jpeg_range: [60, 100]
 
-        #    blur_kernel_size: [19,20]
-        #    kernel_list: ['iso', 'aniso']
-        #    kernel_prob: [0.5, 0.5]
-        #    blur_sigma: [0.1, 10]
-        #    downsample_range: [0.8, 8]
-        #    noise_range: [0, 20]
-        #    jpeg_range: [60, 100]
+        # color jitter and gray
+        #color_jitter_prob: ~
+        color_jitter_shift: 20
+        #color_jitter_pt_prob: ~
+        
+        #gray_prob: ~
+        gt_gray: True
 
-        #    # color jitter and gray
-        #    #color_jitter_prob: ~
-        #    color_jitter_shift: 20
-        #    #color_jitter_pt_prob: ~
-        #    
-        #    #gray_prob: ~
-        #    gt_gray: True
+        #exposure_prob: ~
+        exposure_range: [0.7, 1.1]
+        
+        shift_prob: ~
+        shift_unit: 1
+        shift_max_num: 32
 
-        #    #exposure_prob: ~
-        #    exposure_range: [0.7, 1.1]
-        #    
-        #    shift_prob: ~
-        #    shift_unit: 1
-        #    shift_max_num: 32
+        #uneven_prob: ~
+        
+        #hazy_prob: ~
+        hazy_alpha: [0.75, 0.95]
 
-        #    #uneven_prob: ~
-        #    
-        #    #hazy_prob: ~
-        #    hazy_alpha: [0.75, 0.95]
+        #img_size: [512, 512]
 
-        #    #img_size: [512, 512]
-
-        #    crop_components: False
-        #    component_path: /scratch/tnguy231/RFExperiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
-        #    eye_enlarge_ratio: 1.4
+        crop_components: False
+        component_path: /scratch/tnguy231/RF++/experiments/pretrained_models/FFHQ_eye_mouth_landmarks_512.pth
+        eye_enlarge_ratio: 1.4
 
 lightning:
   trainer:

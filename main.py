@@ -13,7 +13,7 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from pytorch_lightning.trainer import Trainer
 from pytorch_lightning import seed_everything
 from copy import deepcopy
-import random, wandb
+import random, wandb, cv2, time
 torch.set_float32_matmul_precision('high')
 torch._dynamo.config.cache_size_limit = 256
 torch.backends.cudnn.benchmark = True
@@ -270,7 +270,9 @@ class ImageLogger(Callback):
         grids = dict()
         for k in images:
             grid = torchvision.utils.make_grid(images[k], nrow=4)
-            grids[f"{split}/{k}"] = wandb.Image(grid, )
+            grid_img = Image.fromarray(((grid + 1) * 127.5).clamp(0, 255).byte().permute(1, 2, 0).numpy()) # for some reason adding this line makes logging 0.9 s -> 0.3 s for (1024, 2048) img (over just making wandb Image from the grid array)
+            grids[f"{split}/{k}"] = wandb.Image(grid_img, )
+
         pl_module.logger.experiment.log(grids, step=batch_idx)
 
     @rank_zero_only
@@ -291,7 +293,8 @@ class ImageLogger(Callback):
                 batch_idx)
             path = os.path.join(root, filename)
             os.makedirs(os.path.split(path)[0], exist_ok=True)
-            Image.fromarray(grid).save(path)
+            #Image.fromarray(grid).save(path)
+            cv2.imwrite(path, cv2.cvtColor(grid, cv2.COLOR_RGB2BGR)) # like 8x faster than Image.fromarray(grid).save(path); 0.8 s -> 0.1 s
 
     def log_img(self, pl_module, batch, batch_idx, split="train"):
         if (self.check_frequency(batch_idx) and  # batch_idx % self.batch_freq == 0
@@ -319,7 +322,8 @@ class ImageLogger(Callback):
                            pl_module.global_step, pl_module.current_epoch, batch_idx)
 
             logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
-            logger_log_images(pl_module, images, pl_module.global_step - 1, split) # not sure why batch_idx = pl_module.global_step - 1 (and not batch_idx = pl_module.global_step) but it is
+            #logger_log_images(pl_module, images, pl_module.global_step - 1, split) # not sure why batch_idx = pl_module.global_step - 1 (and not batch_idx = pl_module.global_step) but it is
+            logger_log_images(pl_module, images, pl_module.global_step, split) # TODO: not -1?
 
             if is_train:
                 pl_module.train()
@@ -653,6 +657,7 @@ if __name__ == "__main__":
                 except:
                     resume_ckpt = None
                 trainer.fit(model, data, ckpt_path=resume_ckpt)
+                #trainer.fit(model, data)
             except Exception:
                 melk()
                 raise

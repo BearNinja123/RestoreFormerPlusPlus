@@ -240,7 +240,7 @@ class RestoreFormerModel(pl.LightningModule):
                     batch[k] = v.to(memory_format=MEM_FMT)
         return super().transfer_batch_to_device(batch, device, dataloader_idx)
 
-class RBAModel(pl.LightningModule):
+class RAModel(pl.LightningModule):
     def __init__(self,
                  ddconfig,
                  lossconfig,
@@ -279,6 +279,38 @@ class RBAModel(pl.LightningModule):
         self.schedule_step = schedule_step
 
     def init_from_ckpt(self, path, ignore_keys=list()):
+        sd = torch.load(path, map_location="cpu")["state_dict"]
+        keys = list(sd.keys())
+
+        for k in keys:
+            for ik in ignore_keys:
+                if k.startswith(ik):
+                    print("Deleting key {} from state_dict.".format(k))
+                    del sd[k]
+
+        state_dict = self.state_dict()
+        require_keys = state_dict.keys()
+        keys = sd.keys()
+        un_pretrained_keys = []
+        for k in require_keys:
+            if k not in keys: 
+                # miss 'vqvae.'
+                if k[6:] in keys:
+                    state_dict[k] = sd[k[6:]]
+                else:
+                    un_pretrained_keys.append(k)
+            else:
+                state_dict[k] = sd[k]
+
+        # print(f'*************************************************')
+        # print(f"Layers without pretraining: {un_pretrained_keys}")
+        # print(f'*************************************************')
+
+        #self.load_state_dict(state_dict, strict=True)
+        self.load_state_dict(state_dict, strict=False)
+        print(f"Restored from {path}")
+
+    def init_ref_vqvae_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
         keys = list(sd.keys())
 
@@ -410,9 +442,9 @@ class RBAModel(pl.LightningModule):
                 normal_params.append(param)
         opt_ae_params = [{'params': normal_params, 'lr': lr},
                          {'params': special_params, 'lr': lr*self.special_params_lr_scale}]
-        opt_ae = torch.optim.Adam(opt_ae_params, betas=(0.5, 0.9), fused=True)
+        opt_ae = torch.optim.Adam(opt_ae_params, betas=(0.5, 0.9), fused=False)
         opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
-                                    lr=lr, betas=(0.5, 0.9), fused=True)
+                                    lr=lr, betas=(0.5, 0.9), fused=False)
 
         optimizations = [opt_ae, opt_disc]
 

@@ -7,9 +7,9 @@ export BASICSR_JIT=True
 # For RestoreFormer++
 #conf_name='ROHQD'
 #conf_name='RestoreFormerPlusPlus'
-conf_name='RBA'
+conf_name='RA'
 
-root_path='/scratch/tnguy231/RFExperiments/tnguy231'
+root_path='/scratch/tnguy231/RF++/experiments'
 
 node_n=1
 ntasks_per_node=1
@@ -20,7 +20,7 @@ python -u main.py \
 --root-path $root_path \
 --base 'configs/'$conf_name'.yaml' \
 -t True \
---postfix $conf_name'_gpus'$gpu_n \
+--postfix $_gpus$gpu_n \
 --num-nodes $node_n \
 --random-seed True \
 --no-test True \

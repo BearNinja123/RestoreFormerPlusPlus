@@ -1,6 +1,5 @@
 #from sfast.triton.torch_ops import group_norm_silu
 from gnNHWC.custom_gn import GN_NHWC
-from copy import deepcopy
 import numpy as np
 import torch
 import torch.nn as nn
@@ -273,44 +272,30 @@ class CrossAttention(nn.Module):
         self.in_channels = in_channels
         self.head_size = head_size
         self.att_size = in_channels // head_size
-        assert((patch_size * in_channels) % head_size == 0), 'The size of head should be divided by the number of channels.'
+        assert(in_channels % head_size == 0), 'Attention channel count should be divisible by head size.'
         y_ch = in_channels if y_channels is None else y_channels
 
         self.norm1 = Normalize(in_channels)
         if y_channels is not None:
             self.norm2 = Normalize(y_ch)
 
-        #self.q = nn.Conv2d(y_ch * patch_size * patch_size, in_channels, 1) # kinda strange how the y (cross attention input) goes into the query but this is how RF++ does it
-        #self.k = nn.Conv2d(in_channels * patch_size * patch_size, in_channels, 1)
-        #self.v = nn.Conv2d(in_channels * patch_size * patch_size, in_channels, 1)
         # TODO: experiment with groups (maybe dwise conv isn't the way?)
-        self.q = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=in_channels) # kinda strange how the y (cross attention input) goes into the query but this is how RF++ does it
-        self.k = nn.Conv2d(in_channels, in_channels, patch_size, stride=patch_size, groups=in_channels)
-        self.v = nn.Conv2d(in_channels, in_channels, patch_size, stride=patch_size, groups=in_channels)
+        self.q = nn.Conv2d(in_channels, in_channels, patch_size, stride=patch_size, groups=in_channels) # modified from RF as X is the query and the reference is K/V
+        self.k = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels, y_ch))
+        self.v = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels, y_ch))
         self.proj_out = nn.Conv2d(in_channels, in_channels * patch_size * patch_size, 1, groups=in_channels)
+        self.res_weight = nn.Parameter(torch.zeros(()))
 
     def split_heads(self, x):
         B, _C, H, W = x.shape
         # B (hD) H W -> B h D (HW) -> B h (HW) D, D = d_head (self.att_size), h = num heads (self.head_size)
         return x.view(B, self.head_size, self.att_size, H * W).transpose(2, 3) #.contiguous()
     
-    def forward(self, x, y=None):
-        B, C, H, W = x.shape
-        kv = self.norm1(x)
-        q = kv if y is None else self.norm2(y)
-        q, k, v = map(self.split_heads, (self.q(q), self.k(kv), self.v(kv)))
-
-        # compute attention
-        att = F.scaled_dot_product_attention(q, k, v)
-        catted = att.transpose(2, 3).reshape(B, C, H, W) #.contiguous(memory_format=MEM_FMT) # M H N D -> M H D N -> B C H W
-
-        return x + self.proj_out(catted)
-    
     def forward(self, x, y):
         B, C, H, W = x.shape
 
-        kv = self.norm1(x)
-        q = kv if y is None else self.norm2(y)
+        q = self.norm1(x)
+        kv = self.norm2(y)
         q, k, v = map(self.split_heads, (self.q(q), self.k(kv), self.v(kv)))
 
         # compute attention
@@ -318,7 +303,7 @@ class CrossAttention(nn.Module):
         catted = att.transpose(2, 3).reshape(B, C, H // self.patch_size, W // self.patch_size) #.contiguous(memory_format=MEM_FMT) # M H N D -> M H D N -> B C H W
         out = F.pixel_shuffle(self.proj_out(catted), self.patch_size)
 
-        return x + out
+        return x + self.res_weight * out
 
 class MultiHeadEncoder(nn.Module):
     def __init__(
@@ -334,6 +319,7 @@ class MultiHeadEncoder(nn.Module):
         self.resolution = resolution
         self.in_channels = in_channels
         self.enable_mid = enable_mid
+        self.channel_counts = {}
 
         # downsampling
         self.conv_in = nn.Conv2d(in_channels, self.ch, 3, padding=1)
@@ -343,6 +329,7 @@ class MultiHeadEncoder(nn.Module):
         self.down = nn.ModuleList()
         for layer_idx, mult in enumerate(ch_mult):
             block_in, block_out = block_out, ch * mult
+
             block = [ResnetBlock(block_in, block_out, dropout=dropout)]
             block += [ResnetBlock(block_out, block_out, dropout=dropout) for _ in range(self.num_res_blocks-1)]
             attn = [MultiHeadAttnBlock(block_out, head_size) for _ in range(self.num_res_blocks)] if curr_res in attn_resolutions else []
@@ -350,6 +337,7 @@ class MultiHeadEncoder(nn.Module):
             down.block = nn.ModuleList(block)
             down.attn = nn.ModuleList(attn)
 
+            self.channel_counts[curr_res] = block_out
             if layer_idx != self.num_resolutions - 1:
                 down.downsample = Downsample(block_out, resamp_with_conv)
                 curr_res = curr_res // 2
@@ -366,20 +354,22 @@ class MultiHeadEncoder(nn.Module):
         self.norm_out = Normalize(block_out, activation='silu')
         self.conv_out = nn.Conv2d(block_out, 2 * z_channels if double_z else z_channels, 3, padding=1)
 
-    def forward(self, x):
+    def forward(self, x, shape_key=False):
         hs = {}
         # downsampling
         h = self.conv_in(x)
         hs['in'] = h
         for i_level in range(self.num_resolutions):
+            level = self.down[i_level]
             for i_block in range(self.num_res_blocks):
-                h = self.down[i_level].block[i_block](h)
-                if len(self.down[i_level].attn) > 0:
-                    h = self.down[i_level].attn[i_block](h)
+                h = level.block[i_block](h)
+                if len(level.attn) > 0:
+                    h = level.attn[i_block](h)
 
             if i_level != self.num_resolutions-1:
-                hs['block_'+str(i_level)] = h
-                h = self.down[i_level].downsample(h)
+                key = h.shape[2:] if shape_key else 'block_'+str(i_level)
+                hs[key] = h
+                h = level.downsample(h)
 
         # middle
         if self.enable_mid:
@@ -387,7 +377,8 @@ class MultiHeadEncoder(nn.Module):
             hs['block_'+str(i_level)+'_atten'] = h
             h = self.mid.attn_1(h)
             h = self.mid.block_2(h)
-            hs['mid_atten'] = h
+            key = h.shape[2:] if shape_key else 'mid_atten'
+            hs[key] = h
 
         # end
         h = self.conv_out(nonlinearity(self.norm_out(h)))
@@ -411,6 +402,7 @@ class MultiHeadDecoder(nn.Module):
         self.give_pre_end = give_pre_end
         self.enable_mid = enable_mid
         self.ex_multi_scale_num = ex_multi_scale_num
+        self.channel_counts = {}
 
         # compute in_ch_mult, block_in and curr_res at lowest res
         curr_res = resolution // 2**(self.num_resolutions-1)
@@ -439,6 +431,7 @@ class MultiHeadDecoder(nn.Module):
             up = nn.Module()
             up.block = nn.ModuleList(block)
             up.attn = nn.ModuleList(attn)
+            self.channel_counts[curr_res] = block_out
             if layer_idx != self.num_resolutions - 1:
                 up.upsample = Upsample(block_out, resamp_with_conv)
                 curr_res = curr_res * 2
@@ -448,11 +441,12 @@ class MultiHeadDecoder(nn.Module):
         self.norm_out = Normalize(block_out, activation='silu')
         self.conv_out = nn.Conv2d(block_out, out_ch, 3, padding=1)
 
-    def forward(self, z, hs=None):
+    def forward(self, z, hs=None, return_hs=False):
         self.last_z_shape = z.shape
 
         # z to block_in
         h = self.conv_in(z)
+        dec_hs = {}
 
         # middle
         if self.enable_mid:
@@ -470,12 +464,15 @@ class MultiHeadDecoder(nn.Module):
                     else:
                         h = up_level.attn[i_block](h, hs['block_'+str(i_level)])
             
+            dec_hs[h.shape[2:]] = h
             if i_level != 0:
                 h = up_level.upsample(h)
 
         # end
         if self.give_pre_end:
             return h
+        if return_hs:
+            return dec_hs
 
         h = self.conv_out(nonlinearity(self.norm_out(h)))
         return h
@@ -594,9 +591,9 @@ class VQVAEGAN(VQVAEGANMultiHeadTransformer): # VQVAEGANMultiHeadTransformer but
         dec = self.decode(quant)
         return dec, diff, info, hs
 
-class RBAEncoder(nn.Module):
+class RAEncoder(nn.Module):
     def __init__(
-            self, ch, ch_mult=(1,2,4,8), num_res_blocks=2,
+            self, ref_encoder, ch, ch_mult=(1,2,4,8), num_res_blocks=2,
             attn_resolutions=[16], dropout=0.0, resamp_with_conv=True, in_channels=3,
             resolution=512, z_channels=256, double_z=False, enable_mid=True,
             head_size=1, cross_attn_patch_size=8, freeze_base_weights=False, **ignore_kwargs
@@ -610,13 +607,14 @@ class RBAEncoder(nn.Module):
         self.enable_mid = enable_mid
         self.freeze_base_weights = freeze_base_weights
 
+        self.ref_encoder = ref_encoder
+
         # downsampling
         self.conv_in = nn.Conv2d(in_channels, self.ch, 3, padding=1)
         block_out = self.ch
 
         curr_res = resolution
         self.down = nn.ModuleList()
-        self.ref_down = nn.ModuleList()
         for layer_idx, mult in enumerate(ch_mult):
             block_in, block_out = block_out, ch * mult
             block = [ResnetBlock(block_in, block_out, dropout=dropout)]
@@ -626,13 +624,12 @@ class RBAEncoder(nn.Module):
             down.block = nn.ModuleList(block)
             down.attn = nn.ModuleList(attn)
             if layer_idx != self.num_resolutions - 1:
+                if curr_res in self.ref_encoder.channel_counts:
+                    down.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=self.ref_encoder.channel_counts[curr_res])
                 down.downsample = Downsample(block_out, resamp_with_conv)
                 curr_res = curr_res // 2
-            ref_down = deepcopy(down)
-            down.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
 
             self.down.append(down)
-            self.ref_down.append(ref_down)
 
         # middle
         if self.enable_mid:
@@ -640,8 +637,8 @@ class RBAEncoder(nn.Module):
             self.mid.block_1 = ResnetBlock(block_out, block_out, dropout=dropout)
             self.mid.attn_1 = MultiHeadAttnBlock(block_out, head_size)
             self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
-            self.ref_mid = deepcopy(self.mid)
-            self.mid.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
+            if curr_res in self.ref_encoder.channel_counts:
+                self.mid.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=self.ref_encoder.channel_counts[curr_res])
 
         # end
         self.norm_out = Normalize(block_out, activation='silu')
@@ -656,24 +653,26 @@ class RBAEncoder(nn.Module):
         hs = {}
         # downsampling
         h = self.conv_in(x)
-        h_ref = self.conv_in(x_ref)
+        h_refs = {} if x_ref is None else self.ref_encoder(x_ref, shape_key=True)
+        #h_refs = {}
+        #for shape, nc in self.ref_encoder.channel_counts.items():
+        #    h_refs[shape] = torch.zeros((x.shape[0], nc, shape, shape), dtype=x.dtype, device=x.device).to(memory_format=MEM_FMT)
+        #h_refs['out'] = torch.zeros((x.shape[0], nc, shape, shape), dtype=x.dtype, device=x.device).to(memory_format=MEM_FMT)
+
         hs['in'] = h
         for i_level in range(self.num_resolutions):
             level = self.down[i_level]
-            ref_level = self.ref_down[i_level]
             for i_block in range(self.num_res_blocks):
                 h = level.block[i_block](h)
-                h_ref = ref_level.block[i_block](h_ref)
                 if len(level.attn) > 0:
                     h = level.attn[i_block](h)
-                    h_ref = ref_level.attn[i_block](h_ref)
-                if x_ref is not None:
-                    h = level.cross_attn(h_ref, h) # h_ref is K/V, h is Q
 
             if i_level != self.num_resolutions-1:
+                if x_ref is not None and h.shape[2:] in h_refs:
+                    h_ref = h_refs[h.shape[2:]]
+                    h = level.cross_attn(h, h_ref) # h_ref is K/V, h is Q
                 hs['block_'+str(i_level)] = h
-                h = self.down[i_level].downsample(h)
-                h_ref = self.down[i_level].downsample(h_ref)
+                h = level.downsample(h)
 
         # middle
         if self.enable_mid:
@@ -682,24 +681,21 @@ class RBAEncoder(nn.Module):
             h = self.mid.attn_1(h)
             h = self.mid.block_2(h)
 
-            h_ref = self.ref_mid.block_1(h_ref)
-            hs['block_'+str(i_level)+'_atten'] = h_ref
-            h_ref = self.ref_mid.attn_1(h_ref)
-            h_ref = self.ref_mid.block_2(h_ref)
-            h = self.mid.cross_attn(h_ref, h)
+            if h.shape[2:] in h_refs:
+                h_ref = h_refs[h.shape[2:]]
+                h = self.mid.cross_attn(h, h_ref)
             hs['mid_atten'] = h
 
         # end
         h = self.conv_out(nonlinearity(self.norm_out(h)))
-        h_ref = self.conv_out(nonlinearity(self.norm_out(h_ref)))
+        hs['ref_out'] = h_refs['out']
         hs['out'] = h
-        hs['ref_out'] = h_ref
 
         return hs
 
-class RBADecoder(nn.Module):
+class RADecoder(nn.Module):
     def __init__(
-            self, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks=2,
+            self, ref_decoder, ch, out_ch, ch_mult=(1,2,4,8), num_res_blocks=2,
             attn_resolutions=16, dropout=0.0, resamp_with_conv=True, in_channels=3,
             resolution=512, z_channels=256, give_pre_end=False, enable_mid=True,
             head_size=1, ex_multi_scale_num=0, cross_attn_patch_size=8, freeze_base_weights=False, **ignorekwargs
@@ -714,6 +710,9 @@ class RBADecoder(nn.Module):
         self.enable_mid = enable_mid
         self.ex_multi_scale_num = ex_multi_scale_num
         self.freeze_base_weights = freeze_base_weights
+
+        #self.ref_decoder = MultiHeadDecoder(32, 3, ch_mult, num_res_blocks=1, attn_resolutions=[16])
+        self.ref_decoder = ref_decoder
 
         # compute in_ch_mult, block_in and curr_res at lowest res
         curr_res = resolution // 2**(self.num_resolutions-1)
@@ -732,12 +731,11 @@ class RBADecoder(nn.Module):
             self.mid.attn_1 = MultiHeadAttnBlock(block_out, head_size)
             self.mid.block_2 = ResnetBlock(block_out, block_out, dropout=dropout)
 
-            self.ref_mid = deepcopy(self.mid)
-            self.mid.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
+            if curr_res in self.ref_decoder.channel_counts:
+                self.mid.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=self.ref_decoder.channel_counts[curr_res])
 
         # upsampling
         self.up = nn.ModuleList()
-        self.ref_up = nn.ModuleList()
         for layer_idx, mult in enumerate(reversed(ch_mult)):
             block_in, block_out = block_out, ch * mult
             block = [ResnetBlock(block_in, block_out, dropout=dropout)]
@@ -746,14 +744,13 @@ class RBADecoder(nn.Module):
             up = nn.Module()
             up.block = nn.ModuleList(block)
             up.attn = nn.ModuleList(attn)
-            ref_up = deepcopy(up)
+            if curr_res in self.ref_decoder.channel_counts:
+                up.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=self.ref_decoder.channel_counts[curr_res])
             if layer_idx != self.num_resolutions - 1:
                 up.upsample = Upsample(block_out, resamp_with_conv)
                 curr_res = curr_res * 2
-            up.cross_attn = CrossAttention(cross_attn_patch_size, block_out, head_size, y_channels=block_out)
 
             self.up.insert(0, up)
-            self.ref_up.insert(0, ref_up)
 
         # end
         self.norm_out = Normalize(block_out, activation='silu')
@@ -769,35 +766,35 @@ class RBADecoder(nn.Module):
 
         # z to block_in
         h = self.conv_in(z)
-        h_ref = self.conv_in(z_ref)
+        h_refs = {} if z_ref is None else self.ref_decoder(z_ref, return_hs=True)
+        #h_refs = {}
+        #for shape, nc in self.ref_decoder.channel_counts.items():
+        #    h_refs[shape] = torch.zeros((z.shape[0], nc, shape, shape), dtype=z.dtype, device=z.device).to(memory_format=MEM_FMT)
 
         # middle
         if self.enable_mid:
             attn_input = hs['mid_atten']
             h = self.mid.block_2(self.mid.attn_1(self.mid.block_1(h), attn_input))
-            h_ref = self.ref_mid.block_2(self.ref_mid.attn_1(self.ref_mid.block_1(h_ref), attn_input))
-            h = self.mid.cross_attn(h_ref, h)
+            if h.shape[2:] in h_refs:
+                h_ref = h_refs[h.shape[2:]]
+                h = self.mid.cross_attn(h, h_ref)
 
         # upsampling
         for rev_i_level, up_level in enumerate(reversed(self.up)):
             i_level = self.num_resolutions - rev_i_level - 1
-            ref_up_level = self.ref_up[i_level]
             for i_block in range(self.num_res_blocks+1):
                 h = up_level.block[i_block](h)
-                h_ref = ref_up_level.block[i_block](h_ref)
                 if len(up_level.attn) > 0:
                     if 'block_'+str(i_level)+'_atten' in hs: # at this point hs is defined
                         h = up_level.attn[i_block](h, hs['block_'+str(i_level)+'_atten'])
-                        h_ref = ref_up_level.attn[i_block](h_ref, hs['block_'+str(i_level)+'_atten'])
                     else:
                         h = up_level.attn[i_block](h, hs['block_'+str(i_level)])
-                        h_ref = ref_up_level.attn[i_block](h_ref, hs['block_'+str(i_level)])
-
-                    h = up_level.cross_attn(h_ref, h)
             
+            if h.shape[2:] in h_refs:
+                h_ref = h_refs[h.shape[2:]]
+                h = up_level.cross_attn(h, h_ref)
             if i_level != 0:
                 h = up_level.upsample(h)
-                h_ref = up_level.upsample(h_ref)
 
         # end
         if self.give_pre_end:
@@ -806,7 +803,7 @@ class RBADecoder(nn.Module):
         h = self.conv_out(nonlinearity(self.norm_out(h)))
         return h
 
-class RBANet(nn.Module):
+class RANet(nn.Module):
     def __init__(
             self,
             n_embed=1024,
@@ -829,9 +826,11 @@ class RBANet(nn.Module):
             ex_multi_scale_num=1,
             freeze_base_weights=False,
     ):
-        super(RBANet, self).__init__()
+        super(RANet, self).__init__()
 
-        self.encoder = RBAEncoder(ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+        self.ref_vqvae = VQVAEGAN(ch=32, ch_mult=(1, 2, 4, 8), num_res_blocks=1, attn_resolutions=()) # TODO: tweak hyperparams
+
+        self.encoder = RAEncoder(self.ref_vqvae.encoder, ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
                                resolution=resolution, z_channels=z_channels, double_z=double_z, 
                                enable_mid=enable_mid, head_size=head_size, freeze_base_weights=freeze_base_weights)
@@ -842,7 +841,7 @@ class RBANet(nn.Module):
 
         for i in range(ex_multi_scale_num):
                 attn_resolutions = [attn_resolutions[0], attn_resolutions[-1]*2]
-        self.decoder = RBADecoder(ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+        self.decoder = RADecoder(self.ref_vqvae.decoder, ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
                                resolution=resolution, z_channels=z_channels, enable_mid=enable_mid, head_size=head_size,
                                ex_multi_scale_num=ex_multi_scale_num, freeze_base_weights=freeze_base_weights)
@@ -858,20 +857,19 @@ class RBANet(nn.Module):
             for module in (self.quantize, self.post_quant_conv, self.decoder):
                 for _, param in module.named_parameters():
                     param.requires_grad = False
-        print('vqvae_arch.py L868', self)
 	    
 
     def encode(self, x, x_ref=None):
         hs = self.encoder(x, x_ref=x_ref)
         h = self.quant_conv(hs['out'])
-        h_ref = self.quant_conv(hs['ref_out'])
+        h_ref = self.ref_vqvae.quant_conv(hs['ref_out']) # TODO: this don't work since hs has no 'ref_out' yet
         quant, emb_loss, info = self.quantize(h)
-        quant_ref, _emb_loss, _info = self.quantize(h_ref)
+        quant_ref, _emb_loss, _info = self.ref_vqvae.quantize(h_ref)
         return quant, quant_ref, emb_loss, info, hs
 
     def decode(self, quant, hs=None, quant_ref=None):
         quant = self.post_quant_conv(quant)
-        quant_ref = self.post_quant_conv(quant_ref)
+        quant_ref = self.ref_vqvae.post_quant_conv(quant_ref)
         dec = self.decoder(quant, hs, z_ref=quant_ref)
         return dec
 
