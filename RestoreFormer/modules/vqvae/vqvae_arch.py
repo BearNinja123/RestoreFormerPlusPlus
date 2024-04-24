@@ -266,7 +266,14 @@ class MultiHeadAttnBlock(nn.Module):
         return x + self.proj_out(catted)
 
 class CrossAttention(nn.Module):
-    def __init__(self, patch_size, in_channels, head_size=1, y_channels=None):
+    def __init__(
+        self, patch_size, in_channels,
+        head_size=1, y_channels=None,
+        n_ffn=1, ffn_expansion=4,
+        group_div=1,
+        n_res_blocks_pre_proj=0,
+        n_res_blocks_post_proj=0,
+        ):
         super().__init__()
         self.patch_size = patch_size # input will be reshaped from BCHW -> B, (C * patch_size * patch_size, H / patch_size, W / patch_size)
         self.in_channels = in_channels
@@ -275,33 +282,63 @@ class CrossAttention(nn.Module):
         assert(in_channels % head_size == 0), 'Attention channel count should be divisible by head size.'
         y_ch = in_channels if y_channels is None else y_channels
 
-        self.norm1 = Normalize(in_channels)
-        if y_channels is not None:
-            self.norm2 = Normalize(y_ch)
+        #self.norm1 = Normalize(in_channels)
+        #if y_channels is not None:
+        #    self.norm2 = Normalize(y_ch)
 
-        # TODO: experiment with groups (maybe dwise conv isn't the way?)
-        self.q = nn.Conv2d(in_channels, in_channels, patch_size, stride=patch_size, groups=in_channels) # modified from RF as X is the query and the reference is K/V
-        self.k = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels, y_ch))
-        self.v = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels, y_ch))
-        self.proj_out = nn.Conv2d(in_channels, in_channels * patch_size * patch_size, 1, groups=in_channels)
+        #self.q = nn.Conv2d(in_channels, in_channels, patch_size, stride=patch_size, groups=in_channels) # modified from RF as X is the query and the reference is K/V
+        #self.k = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels, y_ch))
+        #self.v = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels, y_ch))
+        #self.proj_out = nn.Conv2d(in_channels, in_channels * patch_size * patch_size, 1, groups=in_channels)
+        self.q = nn.Conv2d(in_channels, in_channels, patch_size, stride=patch_size, groups=max(in_channels // group_div, 1)) # modified from RF as X is the query and the reference is K/V
+        self.k = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels // group_div, y_ch // group_div))
+        self.v = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels // group_div, y_ch // group_div))
+        self.q_norms = nn.ModuleList([nn.LayerNorm(in_channels) for _ in range(n_ffn)])
+        self.k_norms = nn.ModuleList([nn.LayerNorm(in_channels) for _ in range(n_ffn)])
+        self.v_norms = nn.ModuleList([nn.LayerNorm(in_channels) for _ in range(n_ffn)])
+        self.mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(in_channels),
+                nn.Linear(in_channels, ffn_expansion * in_channels),
+                nn.GELU(),
+                nn.Linear(ffn_expansion * in_channels, in_channels),
+                ) for _ in range(n_ffn)
+            ])
+        self.pre_proj_res_blocks = nn.Sequential(*[ResnetBlock(in_channels) for _ in range(n_res_blocks_pre_proj)])
+        self.proj_out = nn.Conv2d(in_channels, in_channels * patch_size * patch_size, 1, groups=max(in_channels // group_div, 1))
+        self.post_proj_res_blocks = nn.Sequential(*[ResnetBlock(in_channels) for _ in range(n_res_blocks_post_proj)])
         self.res_weight = nn.Parameter(torch.zeros(()))
 
     def split_heads(self, x):
         B, _C, H, W = x.shape
         # B (hD) H W -> B h D (HW) -> B h (HW) D, D = d_head (self.att_size), h = num heads (self.head_size)
         return x.view(B, self.head_size, self.att_size, H * W).transpose(2, 3) #.contiguous()
+
+    def flatten_2d(self, x):
+        B, C, H, W = x.shape
+        # B C H W -> B C (HW) -> B (HW) C
+        return x.view(B, C, H * W).transpose(1, 2) #.contiguous()
     
     def forward(self, x, y):
         B, C, H, W = x.shape
 
-        q = self.norm1(x)
-        kv = self.norm2(y)
-        q, k, v = map(self.split_heads, (self.q(q), self.k(kv), self.v(kv)))
+        #q = self.norm1(x)
+        #kv = self.norm2(y)
+        #q, k, v = map(self.split_heads, (self.q(q), self.k(kv), self.v(kv)))
+        q, k, v = map(self.flatten_2d, (self.q(x), self.k(y), self.v(y)))
 
         # compute attention
-        att = F.scaled_dot_product_attention(q, k, v)
-        catted = att.transpose(2, 3).reshape(B, C, H // self.patch_size, W // self.patch_size) #.contiguous(memory_format=MEM_FMT) # M H N D -> M H D N -> B C H W
+        for q_norm, k_norm, v_norm, mlp in zip(self.q_norms, self.k_norms, self.v_norms, self.mlps):
+            q_normed, k_normed, v_normed = map(lambda x: x.view(B, -1, self.head_size, self.att_size).transpose(1, 2), (q_norm(q), k_norm(k), v_norm(v)))
+            att = F.scaled_dot_product_attention(q_normed, k_normed, v_normed)
+            att = att.transpose(1, 2).view(B, -1, C) + q
+            q = att + mlp(att)
+        att = q
+        #catted = att.transpose(2, 3).reshape(B, C, H // self.patch_size, W // self.patch_size) #.contiguous(memory_format=MEM_FMT) # M H N D -> M H D N -> B C H W
+        catted = att.transpose(1, 2).reshape(B, C, H // self.patch_size, W // self.patch_size) #.contiguous(memory_format=MEM_FMT) # M H N D -> M H D N -> B C H W
+        catted = self.pre_proj_res_blocks(catted)
         out = F.pixel_shuffle(self.proj_out(catted), self.patch_size)
+        out = self.post_proj_res_blocks(out)
 
         return x + self.res_weight * out
 
@@ -858,7 +895,6 @@ class RANet(nn.Module):
                 for _, param in module.named_parameters():
                     param.requires_grad = False
 	    
-
     def encode(self, x, x_ref=None):
         hs = self.encoder(x, x_ref=x_ref)
         h = self.quant_conv(hs['out'])

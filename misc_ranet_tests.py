@@ -5,7 +5,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import torch
 
-OPTION = 2
+OPTION = 0
 if OPTION == 0:
     with torch.no_grad():
         x = torch.randn((1,3,512, 512)).cuda().to(memory_format=MEM_FMT).bfloat16()
@@ -27,6 +27,7 @@ if OPTION == 0:
             y = m2(x)[0]
             torch.cuda.synchronize()
 
+        print('!')
         fig, ax = plt.subplots(1, 2)
         y = m(x, x)[0]
         yimg = y[0].permute(1, 2, 0).cpu()
