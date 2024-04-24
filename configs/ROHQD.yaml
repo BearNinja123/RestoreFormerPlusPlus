@@ -12,7 +12,7 @@ model:
         embed_dim: 256
         n_embed: 1024
         double_z: False
-        z_channels: 512
+        z_channels: 256
         resolution: 512
         in_channels: 3
         out_ch: 3

@@ -322,8 +322,7 @@ class ImageLogger(Callback):
                            pl_module.global_step, pl_module.current_epoch, batch_idx)
 
             logger_log_images = self.logger_log_images.get(logger, lambda *args, **kwargs: None)
-            #logger_log_images(pl_module, images, pl_module.global_step - 1, split) # not sure why batch_idx = pl_module.global_step - 1 (and not batch_idx = pl_module.global_step) but it is
-            logger_log_images(pl_module, images, pl_module.global_step, split) # TODO: not -1?
+            logger_log_images(pl_module, images, pl_module.global_step - 1, split) # batch_idx = pl_module.global_step-1 (not pl_module.global_step)
 
             if is_train:
                 pl_module.train()

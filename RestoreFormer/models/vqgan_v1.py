@@ -245,6 +245,7 @@ class RAModel(pl.LightningModule):
                  ddconfig,
                  lossconfig,
                  ckpt_path=None,
+                 ref_vqvae_ckpt_path=None,
                  ignore_keys=[],
                  image_key="lq",
                  colorize_nlabels=None,
@@ -265,8 +266,11 @@ class RAModel(pl.LightningModule):
         print("Loss max discriminator weight:", self.loss.max_discriminator_weight)
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+        if ref_vqvae_ckpt_path is not None:
+            self.init_ref_vqvae_from_ckpt(ref_vqvae_ckpt_path, ignore_keys=ignore_keys)
         
-        if ('comp_weight' in lossconfig['params'] and lossconfig['params']['comp_weight']) or ('comp_style_weight' in lossconfig['params'] and lossconfig['params']['comp_style_weight']):
+        if ('comp_weight' in lossconfig['params'] and lossconfig['params']['comp_weight']) or \
+        ('comp_style_weight' in lossconfig['params'] and lossconfig['params']['comp_style_weight']):
             self.use_facial_disc = True
         else:
             self.use_facial_disc = False
@@ -277,6 +281,7 @@ class RAModel(pl.LightningModule):
         self.special_params_lr_scale = special_params_lr_scale
         self.comp_params_lr_scale = comp_params_lr_scale
         self.schedule_step = schedule_step
+        self._freeze_fr_weights()
 
     def init_from_ckpt(self, path, ignore_keys=list()):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -311,36 +316,37 @@ class RAModel(pl.LightningModule):
         print(f"Restored from {path}")
 
     def init_ref_vqvae_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")["state_dict"]
-        keys = list(sd.keys())
+        '''
+        Given a pretrained reference VQVAE path, load this into the RA model.
+        '''
+        pretrained_sd = torch.load(path, map_location="cpu")["state_dict"]
+        pretrained_keys = list(pretrained_sd.keys())
 
-        for k in keys:
+        for k in pretrained_keys:
             for ik in ignore_keys:
                 if k.startswith(ik):
                     print("Deleting key {} from state_dict.".format(k))
-                    del sd[k]
+                    del pretrained_sd[k]
 
         state_dict = self.state_dict()
-        require_keys = state_dict.keys()
-        keys = sd.keys()
-        un_pretrained_keys = []
-        for k in require_keys:
-            if k not in keys: 
-                # miss 'vqvae.'
-                if k[6:] in keys:
-                    state_dict[k] = sd[k[6:]]
-                else:
-                    un_pretrained_keys.append(k)
-            else:
-                state_dict[k] = sd[k]
+        for k in state_dict.keys():
+            if 'ref_vqvae' in k:
+                # key in RAModel will be of form 'vqvae.ref_vqvae.*'
+                # corresponding ref. VQVAE key will be 'vqvae.*' so we have to remove it
+                state_dict[k] = pretrained_sd[k.replace('vqvae.ref_vqvae.', 'vqvae.')]
 
-        # print(f'*************************************************')
-        # print(f"Layers without pretraining: {un_pretrained_keys}")
-        # print(f'*************************************************')
-
-        #self.load_state_dict(state_dict, strict=True)
         self.load_state_dict(state_dict, strict=False)
-        print(f"Restored from {path}")
+        print(f"Reference VQVAE restored from {path}")
+
+    def _freeze_fr_weights(self):
+        '''
+        Freezes the 
+        '''
+        for name, p in self.vqvae.named_parameters():
+            if 'ref_vqvae' in name or 'decoder.conv_out' in name: # these params still need grads
+                print('L344', name)
+                continue
+            p.requires_grad = False
 
     def forward(self, input, ref):
         dec, diff, info, hs = self.vqvae(input, ref)
@@ -435,6 +441,8 @@ class RAModel(pl.LightningModule):
         special_params = []
         for name, param in self.vqvae.named_parameters():
             if not param.requires_grad:
+                continue
+            if 'decoder.conv_out' in name: # the conv out only needs grad for the adaptive loss, so skip weight updates for this
                 continue
             if 'decoder' in name and 'attn' in name:
                 special_params.append(param)

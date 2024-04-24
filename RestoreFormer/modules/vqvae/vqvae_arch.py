@@ -828,7 +828,7 @@ class RANet(nn.Module):
     ):
         super(RANet, self).__init__()
 
-        self.ref_vqvae = VQVAEGAN(ch=32, ch_mult=(1, 2, 4, 8), num_res_blocks=1, attn_resolutions=()) # TODO: tweak hyperparams
+        self.ref_vqvae = VQVAEGAN(ch=32, ch_mult=(1, 2, 4, 8), num_res_blocks=1, attn_resolutions=(), z_channels=512) # TODO: z_channels should equal 256 after retraining ref. VQVAE
 
         self.encoder = RAEncoder(self.ref_vqvae.encoder, ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,

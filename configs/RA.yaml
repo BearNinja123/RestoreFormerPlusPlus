@@ -4,6 +4,7 @@ model:
   params:
     image_key: 'lq'
     ckpt_path: '/scratch/tnguy231/RF++/experiments/weights/RestoreFormer++.ckpt'
+    ref_vqvae_ckpt_path: '/scratch/tnguy231/RF++/experiments/weights/RestoreFormer++.ckpt'
     special_params_lr_scale: 10
     comp_params_lr_scale: 10
     schedule_step: [4000000, 8000000]

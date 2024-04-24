@@ -48,9 +48,22 @@ elif OPTION == 1:
     print(len(m2.state_dict().keys()))
     print('ra nparams:', sum(p.numel() for p in m2.parameters()))
     m2.load_state_dict(sd, strict=False)
-elif OPTION == 2:
-    m = RANet()
-    m2 = RAModel()
-    print(m2.state_dict.keys())
-    print(len(m.state_dict.keys()))
-    print(len(m2.state_dict.keys()))
+elif OPTION == 2: # test loading reference VQVAE from path, requires a pretrained ref. VQVAE in '/tmp/last.ckpt'
+    m = RAModel(
+        ddconfig={
+            'target': 'RestoreFormer.modules.vqvae.vqvae_arch.RANet',
+            'params': {
+                'fix_decoder': False,
+                'fix_codebook': False,
+                'fix_encoder': False,
+                'z_channels': 512,
+            }
+            },
+        lossconfig={
+            'target': 'RestoreFormer.modules.losses.vqperceptual.VQLPIPSWithDiscriminatorWithCompWithIdentity',
+            'params': {
+                'disc_start': 10001
+                }
+            }
+    )
+    m.init_ref_vqvae_from_ckpt('/tmp/last.ckpt')
