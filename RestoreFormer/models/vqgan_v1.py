@@ -213,8 +213,8 @@ class RestoreFormerModel(pl.LightningModule):
 
     def get_last_layer(self):
         if self.fix_decoder:
-            return self.vqvae.quant_conv #.weight
-        return self.vqvae.decoder.conv_out #.weight
+            return self.vqvae.quant_conv
+        return self.vqvae.decoder.conv_out
 
     @torch.no_grad
     def log_images(self, batch, **kwargs):
@@ -343,12 +343,11 @@ class RAModel(pl.LightningModule):
         Freezes the 
         '''
         for name, p in self.vqvae.named_parameters():
-            if 'ref_vqvae' in name or 'decoder.conv_out' in name: # these params still need grads
-                print('L344', name)
+            if 'cross_attn' in name or 'decoder.conv_out' in name: # these params still need grads
                 continue
             p.requires_grad = False
 
-    def forward(self, input, ref):
+    def forward(self, input, ref=None):
         dec, diff, info, hs = self.vqvae(input, ref)
         return dec, diff, info, hs
 
@@ -448,6 +447,7 @@ class RAModel(pl.LightningModule):
                 special_params.append(param)
             else:
                 normal_params.append(param)
+            print('L450', name)
         opt_ae_params = [{'params': normal_params, 'lr': lr},
                          {'params': special_params, 'lr': lr*self.special_params_lr_scale}]
         opt_ae = torch.optim.Adam(opt_ae_params, betas=(0.5, 0.9), fused=False)
@@ -488,10 +488,12 @@ class RAModel(pl.LightningModule):
         x = batch[self.image_key].to(self.device)
         ref = batch['ref'].to(self.device)
         xrec, _qloss, _info, _hs = self(x, ref)
+        xrec_no_ref, _qloss, _info, _hs = self(x)
         self.vqvae.train()
         log["inputs"] = x
         log["references"] = ref
         log["reconstructions"] = xrec
+        log["reconstructions_no_ref"] = xrec_no_ref
 
         if self.image_key != 'gt':
             #x = (batch['gt'] - batch['mean'][:, :, None, None]) * batch['rstd'][:, :, None, None]

@@ -4,7 +4,7 @@ model:
   params:
     image_key: 'lq'
     ckpt_path: '/scratch/tnguy231/RF++/experiments/weights/RestoreFormer++.ckpt'
-    ref_vqvae_ckpt_path: '/scratch/tnguy231/RF++/experiments/weights/RestoreFormer++.ckpt'
+    ref_vqvae_ckpt_path: '/scratch/tnguy231/RF++/experiments/logs/2024-04-23T17-12-08_RA_VQVAE_gpus4_seed69/checkpoints/last.ckpt'
     special_params_lr_scale: 10
     comp_params_lr_scale: 10
     schedule_step: [4000000, 8000000]
@@ -49,7 +49,7 @@ model:
 data:
   target: main.DataModuleFromConfig
   params:
-    batch_size: 16 # per device
+    batch_size: 4 # per device
     num_workers: 7
     train:
       target: RestoreFormer.data.ref_dataset.RefDataset

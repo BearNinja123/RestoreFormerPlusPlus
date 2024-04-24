@@ -688,7 +688,7 @@ class RAEncoder(nn.Module):
 
         # end
         h = self.conv_out(nonlinearity(self.norm_out(h)))
-        hs['ref_out'] = h_refs['out']
+        hs['ref_out'] = h_refs['out'] if 'out' in h_refs else None
         hs['out'] = h
 
         return hs
@@ -828,7 +828,7 @@ class RANet(nn.Module):
     ):
         super(RANet, self).__init__()
 
-        self.ref_vqvae = VQVAEGAN(ch=32, ch_mult=(1, 2, 4, 8), num_res_blocks=1, attn_resolutions=(), z_channels=512) # TODO: z_channels should equal 256 after retraining ref. VQVAE
+        self.ref_vqvae = VQVAEGAN(ch=32, ch_mult=(1, 2, 4, 8), num_res_blocks=1, attn_resolutions=())
 
         self.encoder = RAEncoder(self.ref_vqvae.encoder, ch=ch, out_ch=out_ch, ch_mult=ch_mult, num_res_blocks=num_res_blocks,
                                attn_resolutions=attn_resolutions, dropout=dropout, in_channels=in_channels,
@@ -862,14 +862,17 @@ class RANet(nn.Module):
     def encode(self, x, x_ref=None):
         hs = self.encoder(x, x_ref=x_ref)
         h = self.quant_conv(hs['out'])
-        h_ref = self.ref_vqvae.quant_conv(hs['ref_out']) # TODO: this don't work since hs has no 'ref_out' yet
         quant, emb_loss, info = self.quantize(h)
-        quant_ref, _emb_loss, _info = self.ref_vqvae.quantize(h_ref)
+        if x_ref is None:
+            quant_ref = None
+        else: # ref image provided -> calculate the quantized vectors of x_ref
+            h_ref = self.ref_vqvae.quant_conv(hs['ref_out'])
+            quant_ref, _emb_loss, _info = self.ref_vqvae.quantize(h_ref)
         return quant, quant_ref, emb_loss, info, hs
 
     def decode(self, quant, hs=None, quant_ref=None):
         quant = self.post_quant_conv(quant)
-        quant_ref = self.ref_vqvae.post_quant_conv(quant_ref)
+        quant_ref = None if quant_ref is None else self.ref_vqvae.post_quant_conv(quant_ref)
         dec = self.decoder(quant, hs, z_ref=quant_ref)
         return dec
 

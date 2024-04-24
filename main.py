@@ -651,12 +651,12 @@ if __name__ == "__main__":
         # run
         if opt.train:
             try:
-                try:
-                    resume_ckpt = config.model.params.ckpt_path
-                except:
-                    resume_ckpt = None
-                trainer.fit(model, data, ckpt_path=resume_ckpt)
-                #trainer.fit(model, data)
+                #try:
+                #    resume_ckpt = config.model.params.ckpt_path
+                #except:
+                #    resume_ckpt = None
+                #trainer.fit(model, data, ckpt_path=resume_ckpt)
+                trainer.fit(model, data)
             except Exception:
                 melk()
                 raise
