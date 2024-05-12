@@ -5,7 +5,7 @@ from PIL import Image
 import matplotlib.pyplot as plt
 import torch
 
-OPTION = 0
+OPTION = 1
 if OPTION == 0:
     with torch.no_grad():
         x = torch.randn((1,3,512, 512)).cuda().to(memory_format=MEM_FMT).bfloat16()

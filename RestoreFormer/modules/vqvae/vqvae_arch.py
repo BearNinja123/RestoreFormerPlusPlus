@@ -269,7 +269,7 @@ class CrossAttention(nn.Module):
     def __init__(
         self, patch_size, in_channels,
         head_size=1, y_channels=None,
-        n_ffn=1, ffn_expansion=4,
+        n_ffn=3, ffn_expansion=4,
         group_div=1,
         n_res_blocks_pre_proj=0,
         n_res_blocks_post_proj=0,
@@ -291,8 +291,8 @@ class CrossAttention(nn.Module):
         #self.v = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels, y_ch))
         #self.proj_out = nn.Conv2d(in_channels, in_channels * patch_size * patch_size, 1, groups=in_channels)
         self.q = nn.Conv2d(in_channels, in_channels, patch_size, stride=patch_size, groups=max(in_channels // group_div, 1)) # modified from RF as X is the query and the reference is K/V
-        self.k = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels // group_div, y_ch // group_div))
-        self.v = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=np.gcd(in_channels // group_div, y_ch // group_div))
+        self.k = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=max(np.gcd(in_channels // group_div, y_ch // group_div), 1))
+        self.v = nn.Conv2d(y_ch, in_channels, patch_size, stride=patch_size, groups=max(np.gcd(in_channels // group_div, y_ch // group_div), 1))
         self.q_norms = nn.ModuleList([nn.LayerNorm(in_channels) for _ in range(n_ffn)])
         self.k_norms = nn.ModuleList([nn.LayerNorm(in_channels) for _ in range(n_ffn)])
         self.v_norms = nn.ModuleList([nn.LayerNorm(in_channels) for _ in range(n_ffn)])
